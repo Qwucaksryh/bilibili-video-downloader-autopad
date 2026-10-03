@@ -1,0 +1,17 @@
+# 编译中间产物
+/target/
+*.pdb
+*.exp
+*.ilk
+*.o
+*.d
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+.DS_Store
+
+# 保留 dist/ 下的成品 dll（这是给用户直接下载用的）
+!dist/*.dll

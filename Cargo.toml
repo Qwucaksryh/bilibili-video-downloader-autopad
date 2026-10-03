@@ -1,0 +1,22 @@
+[package]
+name = "bdp-autopad"
+version = "0.1.0"
+edition = "2021"
+description = "自动为「第N话」补零的 bilibili-video-downloader 插件"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+bilibili-video-downloader-plugin-sdk = { path = "vendor/plugin-sdk" }
+regex = "1"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+# 绝不能写 panic = "abort"：SDK 的 export_plugin_v1! 靠 catch_unwind 把插件异常
+# 转成错误码，配合 descriptor 里的 FailOpen 让宿主记日志继续跑。
+# 一旦改成 abort，插件里任何 panic 都会直接崩掉整个下载器进程。
+panic = "unwind"

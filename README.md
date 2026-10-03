@@ -1,0 +1,153 @@
+# bdp-autopad · 自动补零插件
+
+给 **[哔哩哔哩视频下载器](https://github.com/lanyeeee/bilibili-video-downloader)**（`lanyeeee/bilibili-video-downloader`）写的插件：下载时自动把集数补零。
+
+- `第1话 第一波攻势` → `第01话 第一波攻势`
+- 目录格式只写 `{episode_order}` 时的裸数字 `1` → `01`
+- **补几位不用你填**——插件自己从下载任务里推断合集集数
+
+**不用编译，直接用**：`dist/bdp_autopad.dll` 就是编译好的成品。
+
+---
+
+## 为什么必须写插件
+
+下载器自带的目录格式模板做不到这件事。它用的 `strfmt` 格式化库**明确不支持零填充**：
+
+```
+{episode_order:03}  →  error: sign aware zero padding and Align '=' not yet supported
+```
+
+而 `{episode_title}` 只是普通字符串，模板引擎不会去解析里面的 `第1话` 再补零。所以在模板层是无解的。
+
+好在宿主暴露了 `AfterPrepare` 钩子，会在**创建目录之前**把 `episode_dir` / `filename` 交给插件改写——本插件就是在这里下手。
+
+---
+
+## 安装（3 步）
+
+1. 把 [`dist/bdp_autopad.dll`](dist/bdp_autopad.dll) 放到一个**不会被清理的固定目录**，例如
+   `C:\Users\<你>\Videos\bilibili-plugin\bdp_autopad.dll`
+   （后端要求**绝对路径**且文件必须存在，别放临时目录或下载文件夹）
+
+2. 打开下载器 → **设置** → **插件**面板 → 点 **「添加插件」** → 选中该 dll
+
+3. 确认状态显示 **「已加载」**，然后开始下载
+
+> 插件出错时按 `FailOpen` 记录日志并继续，**不会中断你的下载任务**。
+
+---
+
+## 补零规则
+
+### 位数由合集集数自动决定
+
+插件读取 `%APPDATA%\com.lanyeeee.bilibili-video-downloader\.下载任务\*.json`，按 `collection_title` 聚合出 `episode_order` 的最大值：
+
+| 合集集数 | 输出宽度 | 例 |
+|---|---|---|
+| ≤ 99 | 2 位 | `第01话` |
+| ≤ 999 | 3 位 | `第001话` |
+| ≤ 9999 | 4 位 | `第0001话` |
+
+### 支持的写法
+
+| 输入 | 12 集合集的输出 |
+|---|---|
+| `第1话 第一波攻势` | `第01话 第一波攻势` |
+| `第12话 灰之魔女…` | `第12话 灰之魔女…`（够长就不动） |
+| `1`（纯数字） | `01` |
+| `2.` | `02.` |
+| `1 - 标题` | `01 - 标题` |
+| `1080p` / `128kbps` / `2024` | **原样不动** |
+| `正片` / `原版` / `第1.5话 特别篇` | **原样不动** |
+
+- 支持 `第N话`、`第N集`、`第N期`，以及纯数字开头的文件名
+- `.mp4` 扩展名始终原样保留
+- 只补位、不截断，补过零的不会叠加
+
+---
+
+## 配置
+
+首次加载会在下载器数据目录自动生成：
+
+```
+%APPDATA%\com.lanyeeee.bilibili-video-downloader\autopad.toml
+```
+
+```toml
+enabled = true        # 总开关
+min_width = 2         # 宽度下限（2 = 12 集的季番也写成 第01话）
+max_width = 4         # 宽度上限
+fixed_width = false   # true = 忽略自动探测，一律用 min_width
+pad_filename = true   # 文件名里的集数是否补零
+pad_episode_dir = true
+verbose = false       # true = 往控制台打探测日志
+```
+
+**改完需要重启下载器**（配置只在进程启动后读一次）。
+也可以用环境变量临时覆盖：`AUTOPAD_MIN_WIDTH=3`、`AUTOPAD_ENABLED=0`。
+
+---
+
+## 影响范围
+
+| 维度 | 情况 |
+|---|---|
+| 运行位置 | 只在下载器进程内，靠 `AfterPrepare` 钩子调用 |
+| 改什么 | 只改**本次任务**的 `episode_dir` / `filename` |
+| 老文件 | 不会动已经下载好的文件（钩子只在下载流程中触发） |
+| 其他软件 | 完全不碰，不注册全局钩子、不装服务、不开机自启 |
+
+---
+
+## 自己编译
+
+工具链：**Rust (GNU target)** + **mingw-w64**（提供 `gcc` / `as` / `dlltool`，缺了会在 `parking_lot_core` 处报 `dlltool could not create import library`）。
+
+```powershell
+cd bdp-autopad
+cargo test --release     # 5 个单元测试
+cargo build --release    # 产物 target\release\bdp_autopad.dll
+```
+
+### 工程结构
+
+```
+├── Cargo.toml            # cdylib；release 关掉了 panic=abort（见下）
+├── src/
+│   ├── lib.rs            # AfterPrepare 钩子 + 补零逻辑 + 单元测试
+│   ├── config.rs         # autopad.toml 解析（零依赖 key=value）
+│   └── episode_scan.rs   # 扫 .下载任务/*.json 聚合集数
+├── vendor/               # 宿主 v0.2.1 的 plugin-api / plugin-sdk（MIT）
+└── dist/bdp_autopad.dll  # 编译产物
+```
+
+### 踩过的坑（改代码前必读）
+
+1. **`regex` crate 不支持环视**（`(?=...)`、`(?!...)`），写进去会直接编译失败。
+   「数字后面不能是字母」这条规则只能取出来用代码判断。
+2. **`Cargo.toml` 里绝不能写 `panic = "abort"`**。SDK 的 `export_plugin_v1!` 靠
+   `catch_unwind` 把插件异常转成错误码，配合 `FailOpen` 让宿主记日志继续跑；
+   改成 abort 会让插件里任何 panic **直接崩掉整个下载器进程**。
+3. **不能 `use std::sync::LazyLock`**——`export_plugin_v1!` 宏展开时也导入了它，
+   同作用域重复导入报 E0252，改用全路径引用。
+4. **宿主只校验 `task_id` 不可改**；`episode_dir` / `filename` 可自由修改，
+   而且 `create_dir_all` 在 hook 返回**之后**才执行，所以改动会真正生效。
+5. 写 `plugin.json` 必须用**无 BOM 的 UTF-8**——宿主是
+   `serde_json::from_str(...).unwrap_or_default()`，带 BOM 会静默解析失败变成空表，
+   插件看着写进去了却根本不加载。
+
+---
+
+## 许可证
+
+[MIT](LICENSE)，与原项目相同。
+
+`vendor/` 目录下的 `plugin-api` / `plugin-sdk` 取自
+[lanyeeee/bilibili-video-downloader](https://github.com/lanyeeee/bilibili-video-downloader)（MIT），
+保留其原始版权与许可。
+
+> 该插件系统是**实验性 v1**：插件以进程内动态库形式运行，**与宿主同权限、无沙箱**。
+> 装第三方插件时请自行评估代码。

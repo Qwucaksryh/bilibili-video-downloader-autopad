@@ -1,0 +1,10 @@
+[package]
+name = "bilibili-video-downloader-plugin-api"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "bilibili_video_downloader_plugin_api"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
