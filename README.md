@@ -13,7 +13,7 @@
 > 欢迎提 issue。
 
 **不用编译，直接用**：[`dist/bdp_autopad.dll`](dist/bdp_autopad.dll) 就是编译好的成品，
-也可以在 [Releases](../../releases) 里直接下载。
+也可以在 [Releases](https://github.com/Qwucaksryh/bilibili-video-downloader-autopad/releases) 里直接下载。
 
 ---
 
