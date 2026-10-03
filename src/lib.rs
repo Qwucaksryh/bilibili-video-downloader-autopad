@@ -206,7 +206,7 @@ mod tests {
     fn pads_real_titles() {
         // 取自真实下载数据
         let cases = [
-            ("第1话 第一波攻势", 3, "第001话 第一波攻势"),
+            ("第1话 羽丘的不可思议女孩", 3, "第001话 羽丘的不可思议女孩"),
             ("第1话 太子新娘", 2, "第01话 太子新娘"),
             ("第9话 决战", 2, "第09话 决战"),
             ("第10话 EMMA", 2, "第10话 EMMA"),
@@ -261,11 +261,11 @@ mod tests {
 
     #[test]
     fn pads_only_last_path_component() {
-        let path = Path::new(r"C:\Users\Admin\Videos\bilibili Download\第1话 第一波攻势");
+        let path = Path::new(r"C:\Users\Admin\Videos\bilibili Download\第1话 羽丘的不可思议女孩");
         let got = pad_path(path, 3);
         assert_eq!(
             got,
-            Path::new(r"C:\Users\Admin\Videos\bilibili Download\第001话 第一波攻势")
+            Path::new(r"C:\Users\Admin\Videos\bilibili Download\第001话 羽丘的不可思议女孩")
         );
     }
 

@@ -2,11 +2,18 @@
 
 给 **[哔哩哔哩视频下载器](https://github.com/lanyeeee/bilibili-video-downloader)**（`lanyeeee/bilibili-video-downloader`）写的插件：下载时自动把集数补零。
 
-- `第1话 第一波攻势` → `第01话 第一波攻势`
+- `第1话 羽丘的不可思议女孩` → `第01话 羽丘的不可思议女孩`
 - 目录格式只写 `{episode_order}` 时的裸数字 `1` → `01`
 - **补几位不用你填**——插件自己从下载任务里推断合集集数
 
-**不用编译，直接用**：`dist/bdp_autopad.dll` 就是编译好的成品。
+> **⚠️ 关于本仓库**
+> 代码与文档由 **AI 撰写**，但**已经过实测可用**：
+> 5 项单元测试全部通过 → 用 `DllImport` 真实加载 dll 跑通端到端 hook 测试（7 个场景）→
+> 已在 bilibili-video-downloader **v0.2.1 中实际加载并正常运行**。
+> 欢迎提 issue。
+
+**不用编译，直接用**：[`dist/bdp_autopad.dll`](dist/bdp_autopad.dll) 就是编译好的成品，
+也可以在 [Releases](../../releases) 里直接下载。
 
 ---
 
@@ -54,7 +61,7 @@
 
 | 输入 | 12 集合集的输出 |
 |---|---|
-| `第1话 第一波攻势` | `第01话 第一波攻势` |
+| `第1话 羽丘的不可思议女孩` | `第01话 羽丘的不可思议女孩` |
 | `第12话 灰之魔女…` | `第12话 灰之魔女…`（够长就不动） |
 | `1`（纯数字） | `01` |
 | `2.` | `02.` |
@@ -99,6 +106,26 @@ verbose = false       # true = 往控制台打探测日志
 | 改什么 | 只改**本次任务**的 `episode_dir` / `filename` |
 | 老文件 | 不会动已经下载好的文件（钩子只在下载流程中触发） |
 | 其他软件 | 完全不碰，不注册全局钩子、不装服务、不开机自启 |
+
+### 权限
+
+**先说清楚：宿主的插件系统没有任何沙箱或权限约束**——插件是进程内动态库，与下载器**同权限**运行，官方 README 也明确警告过这一点。
+
+所以下面这些**不是系统强制的最小权限，而是本插件代码自身的实际接触面**：
+
+- 只声明了 3 个钩子中的 **1 个**（`AfterPrepare`），`BeforeVideoProcess` / `OnCompleted` 完全不参与
+- **从未调用宿主提供的唯一 Host API**（`host::get_config()`），因此接触不到 `sessdata` 等敏感配置
+- **静态导入表里没有网络组件**——没有 `ws2_32`（socket）、`winhttp`、`wininet`；也没有 `advapi32`（注册表）、`shell32`（COM/shell），只有 `KERNEL32` / `ntdll` / UCRT 系列 / `bcryptprimitives`
+- 文件系统只碰三处：**读** `.下载任务\*.json`、**读** `autopad.toml`、**仅当配置不存在时**写一份默认 `autopad.toml`
+- 环境变量只读 `APPDATA` / `HOME`，以及可选的 `AUTOPAD_MIN_WIDTH` / `AUTOPAD_ENABLED`
+
+自查导入表：
+
+```powershell
+objdump -p dist/bdp_autopad.dll | findstr "DLL Name"
+```
+
+> 诚实补充：没有沙箱意味着技术上插件**可以**调用更多 API（例如动态 `LoadLibrary`），上表只说明**它现在没有**。要长期安心，请自行审阅 [src/](src) 源码——一共 3 个文件、约 400 行。
 
 ---
 
