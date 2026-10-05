@@ -174,7 +174,7 @@ cargo build --release    # 产物 target\release\bdp_autopad.dll
 
 `vendor/` 目录下的 `plugin-api` / `plugin-sdk` 取自
 [lanyeeee/bilibili-video-downloader](https://github.com/lanyeeee/bilibili-video-downloader)（MIT），
-保留其原始版权与许可。
+原始版权声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
 
 > 该插件系统是**实验性 v1**：插件以进程内动态库形式运行，**与宿主同权限、无沙箱**。
 > 装第三方插件时请自行评估代码。

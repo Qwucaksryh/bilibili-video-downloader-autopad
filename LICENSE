@@ -2,11 +2,6 @@ MIT License
 
 Copyright (c) 2026 bdp-autopad contributors
 
-Portions of this software (the `vendor/` directory: plugin-api and plugin-sdk)
-are derived from bilibili-video-downloader
-Copyright (c) 2025-2026 lanyeeee (https://github.com/lanyeeee)
-and are licensed under the MIT License below.
-
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights
