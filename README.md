@@ -8,7 +8,7 @@
 
 > **⚠️ 关于本仓库**
 > 代码与文档由 **AI 撰写**，但**已经过实测可用**：
-> 10 项单元测试全部通过 → `tools\smoke-test.ps1` 用 `P/Invoke` 真实加载 dll 跑通端到端 hook 测试（**29 项断言**）→
+> 25 项单元测试全部通过 → `tools\smoke-test.ps1` 用 `P/Invoke` 真实加载 dll 跑通端到端 hook 测试（**29 项断言**）→
 > 已在 bilibili-video-downloader **v0.2.1 中实际加载并正常运行**。
 > 本轮的格式扩展与探测性能重写由 AI 智能体团队分工完成，改完后另有一轮独立只读审计。
 > 欢迎提 issue。
@@ -152,7 +152,7 @@ objdump -p dist/bdp_autopad.dll | findstr "DLL Name"
 
 ```powershell
 cd bdp-autopad
-cargo test --release     # 10 个单元测试
+cargo test --release     # 25 个单元测试
 cargo build --release    # 产物 target\release\bdp_autopad.dll
 ```
 

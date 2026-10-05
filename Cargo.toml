@@ -1,6 +1,6 @@
 [package]
 name = "bdp-autopad"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "自动为「第N话」补零的 bilibili-video-downloader 插件"
 

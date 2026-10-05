@@ -63,8 +63,18 @@ static PART_RE: std::sync::LazyLock<Regex> =
 struct AutoPadPlugin;
 
 impl PluginV1 for AutoPadPlugin {
+    /// **纯函数，禁止任何 IO。**
+    ///
+    /// 实测依据（`vendor/plugin-sdk/src/lib.rs`）：
+    /// - `DESCRIPTOR_JSON_V1` 是 `LazyLock`，初始化体直接调 `instance.descriptor()`；
+    /// - `descriptor_v1()` 是 `extern "C"` 导出，**外面没有 catch_unwind**
+    ///   （全 SDK 只有 `on_hook_v1` 有 panic → 错误码 的保护）。
+    ///
+    /// 所以 descriptor 里一旦 panic，会顺着 `LazyLock::as_ptr()` 抛到
+    /// `extern "C"` 边界 → Rust 直接 **abort** → 下载器进程崩溃，
+    /// FailOpen 也救不了。原来这里的 `write_default_config_if_absent()`
+    /// 做着真实磁盘 IO（`path.exists()` + `fs::write`），已挪到 `on_hook()`。
     fn descriptor(&self) -> PluginDescriptorV1 {
-        config::write_default_config_if_absent();
         PluginDescriptorV1 {
             sdk_api_version: SDK_API_VERSION,
             id: "bdp-autopad".to_string(),
@@ -78,6 +88,11 @@ impl PluginV1 for AutoPadPlugin {
     }
 
     fn on_hook(&mut self, input: HookInputV1) -> eyre::Result<HookOutputV1> {
+        // 必须在 `Config::get()` 之前落盘，这样第一次读配置就能读到默认值
+        // （语义与旧实现等价：插件加载时 descriptor 先写、随后 hook 才读）。
+        // 这里是 on_hook，已被 SDK 的 catch_unwind 覆盖，IO 出错最多记日志。
+        config::write_default_config_if_absent();
+
         let cfg = config::Config::get();
         if !cfg.enabled {
             return Ok(HookOutputV1 {
@@ -522,5 +537,48 @@ mod tests {
         for title in titles {
             assert_eq!(pad_text(title, 3), title, "title={title}");
         }
+    }
+
+    /// 小数集号只补整数部分：数值没变，读起来仍然是 1.5 集。
+    /// 这条是**钉住现状**的行为测试——`EP1.5` 会变成 `EP01.5`，我们认可这个结果。
+    #[test]
+    fn pads_only_integer_part_of_decimal_numbers() {
+        let cases = [
+            ("EP1.5 标题", 2, "EP01.5 标题"),
+            ("1.5 特别篇", 2, "01.5 特别篇"),
+            ("第1.5话 特别篇", 3, "第1.5话 特别篇"),
+        ];
+        for (input, width, expected) in cases {
+            assert_eq!(pad_text(input, width), expected, "input={input} width={width}");
+        }
+    }
+
+    /// 幂等性：补过零的结果再跑一次必须完全不变（否则会 第01话 → 第001话 叠加）。
+    #[test]
+    fn padding_is_idempotent() {
+        let samples = [
+            ("第1话 羽丘的不可思议女孩", 3),
+            ("第007话 已经补过了", 3),
+            ("1", 2),
+            ("2.", 2),
+            ("[1] 标题", 2),
+            ("【2】标题", 3),
+            ("EP3 标题-P9", 2),
+            ("第1話 标题", 2),
+            ("1080p", 2),
+            ("正片", 3),
+        ];
+        for (input, width) in samples {
+            let once = pad_text(input, width);
+            let twice = pad_text(&once, width);
+            assert_eq!(once, twice, "幂等性被破坏: input={input} width={width}");
+        }
+    }
+
+    /// 多种写法叠在同一个标题里时，每一处都该各补各的。
+    #[test]
+    fn pads_all_formats_stacked_in_one_title() {
+        assert_eq!(pad_text("[1] 第2话 EP3 -P4", 2), "[01] 第02话 EP03 -P04");
+        assert_eq!(pad_text("[10] 第2話 标题", 3), "[010] 第002話 标题");
     }
 }
