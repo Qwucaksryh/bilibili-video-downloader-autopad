@@ -20,13 +20,13 @@ use bilibili_video_downloader_plugin_sdk::{
 };
 use regex::Regex;
 
-/// 抓取「第N话 / 第N集 / 第N期」中间的数字，容忍空格。
-/// 宿主已按 Windows 文件名规则过滤过标题，不会有正则意义上的怪字符。
+/// 抓取「第N话 / 第N集 / 第N期」（含日文写法「第N話」U+8A71、「第N巻」U+5D29）
+/// 中间的数字，容忍空格。宿主已按 Windows 文件名规则过滤过标题，不会有正则意义上的怪字符。
 ///
 /// 注意：不在此处 `use std::sync::LazyLock`，否则会和 `export_plugin_v1!` 宏
 /// 展开出来的同名导入冲突（E0252）。这里全路径引用即可。
 static EPISODE_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"第\s*(\d+)\s*[话集期]").expect("正则编译失败"));
+    std::sync::LazyLock::new(|| Regex::new(r"第\s*(\d+)\s*[话集期話巻]").expect("正则编译失败"));
 
 /// 没有「第N话」时的兜底：抓开头的纯数字，例如 `1`、`2.`、`1 - 标题`、`03、xxx`。
 ///
@@ -37,6 +37,27 @@ static EPISODE_RE: std::sync::LazyLock<Regex> =
 /// 由于只补位不截断，`2024`、`1000` 这种本身就够长的数字也不会被改动。
 static LEADING_NUM_RE: std::sync::LazyLock<Regex> =
     std::sync::LazyLock::new(|| Regex::new(r"^\s*(\d+)").expect("正则编译失败"));
+
+/// 抓取 `EP1` / `EP01` / `Ep 1` / `ep.1` 形态的集数前缀（大小写不敏感，`EP` 与数字之间
+/// 容忍空格与可选的 `.`）。
+///
+/// `regex` crate 不支持环视，「前面不能是单词内部」「后面不能跟字母」两条边界规则
+/// 都放到 [`pad_ep`] 里用代码手工判断（照 [`pad_leading`] 的做法）。
+static EP_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"(?i)ep\s*\.?\s*(\d+)").expect("正则编译失败"));
+
+/// 抓取**文件名开头**的方括号编号：`[01]`、`【01】`（方括号内允许前导空白）。
+///
+/// 只认开头（`^` 锚定）；「方括号里是 `[1080p]` 这类规格值」的判断在 [`pad_bracket`] 里做。
+static BRACKET_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"^(\s*[\[【]\s*)(\d+)").expect("正则编译失败"));
+
+/// 抓取分P序号：字面量 `-P`（横杠 + 大写 P）+ 数字。
+///
+/// 数字长度上限与「后面必须是结尾/非字母数字」的守卫放在 [`pad_part`] 里用代码判断，
+/// 避免误伤 `-P1080` 这类规格值，也不吃进后面的标题文字。
+static PART_RE: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"-P(\d+)").expect("正则编译失败"));
 
 #[derive(Default)]
 struct AutoPadPlugin;
@@ -122,17 +143,38 @@ fn pad_path(path: &Path, width: usize) -> PathBuf {
 
 /// 把集数补零到指定位数。
 ///
-/// 两类形态：
-/// 1. `第N话 / 第N集 / 第N期` —— 就地补零，前后文字与扩展名原样保留
-/// 2. 根本没有「第N话」时（目录格式只写了 `{episode_order}`，名字就是 `1`、`2.`、`1 - 标题`），
-///    取开头那段纯数字补零
+/// 可识别的形态（依次尝试、可同时命中多条，例如 `第1话 标题-P2 分P名` 两条都要处理）：
+/// 1. `第N话 / 第N集 / 第N期 / 第N話 / 第N巻` —— 就地补零，前后文字与扩展名原样保留
+/// 2. `EP1 / EP01 / Ep 1 / ep.1` —— 大小写不敏感的 EP 前缀
+/// 3. 文件名开头的 `[01]`、`【01】` 方括号编号
+/// 4. 分P序号 `-P2`
+/// 5. 以上都没命中时，取开头那段纯数字兜底（目录格式只写了 `{episode_order}`，
+///    名字就是 `1`、`2.`、`1 - 标题`）
 ///
-/// 两种情况都只补位、不截断：`2024`、`1000` 这种本身就够长的数字一律不动。
+/// 所有情况都只补位、不截断：`2024`、`1000`、`-P1080` 这种本身就够长的数字一律不动。
 fn pad_text(text: &str, width: usize) -> String {
-    if EPISODE_RE.is_match(text) {
-        return replace_episode(text, width);
+    let mut matched = false;
+    let mut out = text.to_string();
+
+    if EPISODE_RE.is_match(&out) {
+        out = replace_episode(&out, width);
+        matched = true;
     }
-    pad_leading(text, width)
+    let (next, hit) = pad_ep(&out, width);
+    out = next;
+    matched |= hit;
+    let (next, hit) = pad_bracket(&out, width);
+    out = next;
+    matched |= hit;
+    let (next, hit) = pad_part(&out, width);
+    out = next;
+    matched |= hit;
+
+    if matched {
+        out
+    } else {
+        pad_leading(&out, width)
+    }
 }
 
 /// 把 `第N话` 里的 N 补零。
@@ -142,6 +184,100 @@ fn replace_episode(text: &str, width: usize) -> String {
             splice_digits(&caps[0], &caps[1], width)
         })
         .into_owned()
+}
+
+/// 把 `EP1 / EP01 / Ep 1 / ep.1` 里的数字补零，返回 `(新文本, 是否命中)`。
+///
+/// `regex` crate 不支持环视（lookaround），两条边界规则只能用代码手工判断
+/// （同 [`pad_leading`] 的做法）：
+/// - **匹配起点的前一个字符不能是 ASCII 字母/数字**：否则 `DEEP1`、`STEP3`、`keep9`、
+///   `HDD2` 这类单词内部的 `ep` 会被误伤；
+/// - **数字后面不能直接跟 ASCII 字母**：否则 `EP1080p` 这种规格值会被误伤。
+fn pad_ep(text: &str, width: usize) -> (String, bool) {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    let mut matched = false;
+
+    for caps in EP_RE.captures_iter(text) {
+        let Some(whole) = caps.get(0) else { continue };
+        let (start, end) = (whole.start(), whole.end());
+        let prev_is_word = text[..start]
+            .chars()
+            .next_back()
+            .map_or(false, |c| c.is_ascii_alphanumeric());
+        let next_is_alpha = text[end..].starts_with(|c: char| c.is_ascii_alphabetic());
+        if prev_is_word || next_is_alpha {
+            continue;
+        }
+        out.push_str(&text[last..start]);
+        out.push_str(&splice_digits(whole.as_str(), &caps[1], width));
+        last = end;
+        matched = true;
+    }
+
+    if !matched {
+        return (text.to_string(), false);
+    }
+    out.push_str(&text[last..]);
+    (out, true)
+}
+
+/// 把文件名开头的 `[01]` / `【01】` 编号补零，返回 `(新文本, 是否命中)`。
+///
+/// 「方括号里是 `[1080p]` 这类规格值」的判断没法写成 `(?![A-Za-z])`（`regex` crate
+/// 不支持环视），只能取出来用代码判断，同 [`pad_leading`]。
+fn pad_bracket(text: &str, width: usize) -> (String, bool) {
+    let Some(caps) = BRACKET_RE.captures(text) else {
+        return (text.to_string(), false);
+    };
+    let Some(whole) = caps.get(0) else {
+        return (text.to_string(), false);
+    };
+    let end = whole.end();
+    if text[end..].starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return (text.to_string(), false);
+    }
+    let mut out = String::with_capacity(text.len());
+    out.push_str(&caps[1]);
+    out.push_str(&pad_number(&caps[2], width));
+    out.push_str(&text[end..]);
+    (out, true)
+}
+
+/// 把分P序号 `-P2` 补零成 `-P02`，返回 `(新文本, 是否命中)`。
+///
+/// 「`regex` 不支持环视」的边界规则全部用代码手工判断：
+/// - 只认字面量 `-P`（横杠 + 大写 P），`1080p`、`HDP` 里没有 `-P`，天然不命中；
+/// - 数字长度 ≤ 2 才处理：分P序号极少超过 99，`-P1080`（4 位）直接跳过，不误伤规格值；
+/// - 数字后面必须是结尾或非字母数字字符，防止吃进后面的标题文字；
+/// - 只补位不截断：`-P2` 配 width 3 → `-P002`；`-P10` 配 width 2 → `-P10`（不动）。
+fn pad_part(text: &str, width: usize) -> (String, bool) {
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    let mut matched = false;
+
+    for caps in PART_RE.captures_iter(text) {
+        let Some(whole) = caps.get(0) else { continue };
+        let (start, end) = (whole.start(), whole.end());
+        let digits = &caps[1];
+        if digits.len() > 2 {
+            continue;
+        }
+        let next_ok = text[end..].chars().next().map_or(true, |c| !c.is_alphanumeric());
+        if !next_ok {
+            continue;
+        }
+        out.push_str(&text[last..start]);
+        out.push_str(&splice_digits(whole.as_str(), digits, width));
+        last = end;
+        matched = true;
+    }
+
+    if !matched {
+        return (text.to_string(), false);
+    }
+    out.push_str(&text[last..]);
+    (out, true)
 }
 
 /// 没有「第N话」时，把开头的纯数字补零。
@@ -171,6 +307,14 @@ fn splice_digits(whole: &str, digits: &str, width: usize) -> String {
     match whole.find(digits) {
         Some(idx) => format!("{}{}{}", &whole[..idx], padded, &whole[idx + digits.len()..]),
         None => whole.to_string(),
+    }
+}
+
+/// 把纯数字串补零到 `width` 位（只补位、不截断；解析失败原样返回）。
+fn pad_number(digits: &str, width: usize) -> String {
+    match digits.parse::<u32>() {
+        Ok(order) => format!("{:0>width$}", order, width = width),
+        Err(_) => digits.to_string(),
     }
 }
 
@@ -278,5 +422,105 @@ mod tests {
         assert_eq!(cfg.width_for(1000), 4, "1000 集 -> 4 位");
         assert_eq!(cfg.width_for(0), 2, "探测不到时退回下限");
         assert_eq!(cfg.width_for(99999), 4, "受 max_width 限制");
+    }
+
+    #[test]
+    fn pads_japanese_episode_markers() {
+        let cases = [
+            // 日文写法：第N話（U+8A71）、第N巻（U+5D29）
+            ("第1話 羽丘的不可思议女孩", 3, "第001話 羽丘的不可思议女孩"),
+            ("第1巻 上", 2, "第01巻 上"),
+            ("第12話 标题", 3, "第012話 标题"),
+            ("第9巻", 2, "第09巻"),
+            // 已补零 / 小数 / 够长的都不动
+            ("第007話 已经补过了", 3, "第007話 已经补过了"),
+            ("第1.5話 特别篇", 3, "第1.5話 特别篇"),
+            ("第100話 新的开始", 2, "第100話 新的开始"),
+        ];
+        for (input, width, expected) in cases {
+            assert_eq!(pad_text(input, width), expected, "input={input} width={width}");
+        }
+    }
+
+    #[test]
+    fn pads_ep_prefix() {
+        let cases = [
+            // 正向：EP1 / EP01 / Ep 1 / ep.1，补零但保留原有写法
+            ("EP1 标题", 2, "EP01 标题"),
+            ("EP01 标题", 2, "EP01 标题"),
+            ("Ep 1", 2, "Ep 01"),
+            ("ep.1", 2, "ep.01"),
+            ("【EP2】", 3, "【EP002】"),
+            // 只补不截
+            ("EP100 标题", 2, "EP100 标题"),
+            // 反向：单词内部的 "ep" 不能命中（前导字母边界判断）
+            ("DEEP1", 2, "DEEP1"),
+            ("STEP3", 2, "STEP3"),
+            ("HDD2", 2, "HDD2"),
+            ("keep9", 2, "keep9"),
+            // 反向：数字后面跟 ASCII 字母的是规格值
+            ("EP1080p", 2, "EP1080p"),
+            // 主路径与 EP 边界共存：第N话 照常补零，step3 不被 EP 规则误伤
+            ("第1话 step3 标题", 2, "第01话 step3 标题"),
+        ];
+        for (input, width, expected) in cases {
+            assert_eq!(pad_text(input, width), expected, "input={input} width={width}");
+        }
+    }
+
+    #[test]
+    fn pads_leading_bracket_numbers() {
+        let cases = [
+            // 正向：开头的 [01] / 【01】
+            ("[1] 标题", 3, "[001] 标题"),
+            ("【2】标题", 3, "【002】标题"),
+            ("[01] 标题", 3, "[001] 标题"),
+            ("【002】 标题", 3, "【002】 标题"),
+            // 反向：不在开头的方括号不动
+            ("标题 [01]", 2, "标题 [01]"),
+            // 反向：方括号里是规格值 / 字母（fansub 命名常见 [1080p][HEVC]）
+            ("[1080p] 标题", 2, "[1080p] 标题"),
+            ("[AB12] 标题", 2, "[AB12] 标题"),
+        ];
+        for (input, width, expected) in cases {
+            assert_eq!(pad_text(input, width), expected, "input={input} width={width}");
+        }
+    }
+
+    #[test]
+    fn pads_part_order_suffix() {
+        let cases = [
+            // 正向：分P序号 -P2 -> -P02（可与第N话同时命中）
+            ("第1话 标题-P2 分P名", 2, "第01话 标题-P02 分P名"),
+            ("第1话 标题-P2", 3, "第001话 标题-P002"),
+            ("EP3 标题-P9", 2, "EP03 标题-P09"),
+            // 只补不截
+            ("标题-P10", 2, "标题-P10"),
+            // 反向：P1080 这类规格值不动（数字超过 2 位直接跳过）
+            ("标题-P1080", 4, "标题-P1080"),
+            ("标题-P1080p", 2, "标题-P1080p"),
+            // 反向：只认大写 P
+            ("标题-p2", 2, "标题-p2"),
+        ];
+        for (input, width, expected) in cases {
+            assert_eq!(pad_text(input, width), expected, "input={input} width={width}");
+        }
+    }
+
+    #[test]
+    fn leaves_real_numberless_titles_untouched() {
+        // 取自真实下载数据里完全没有集数的 10 个标题，任何规则都不许命中
+        let titles = [
+            "OAD 感冒综合征",
+            "番外篇 比武招亲",
+            "特别篇 拈花夜话",
+            "原版",
+            "正片",
+            "中文",
+            "卓易通下四款容器类应用使用分享(gspace、gbox、ourplay、元萝卜、google商店、月圆之夜、华为全家桶)",
+        ];
+        for title in titles {
+            assert_eq!(pad_text(title, 3), title, "title={title}");
+        }
     }
 }

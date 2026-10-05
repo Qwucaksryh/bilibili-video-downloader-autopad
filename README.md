@@ -8,8 +8,9 @@
 
 > **⚠️ 关于本仓库**
 > 代码与文档由 **AI 撰写**，但**已经过实测可用**：
-> 5 项单元测试全部通过 → 用 `DllImport` 真实加载 dll 跑通端到端 hook 测试（7 个场景）→
+> 10 项单元测试全部通过 → `tools\smoke-test.ps1` 用 `P/Invoke` 真实加载 dll 跑通端到端 hook 测试（**29 项断言**）→
 > 已在 bilibili-video-downloader **v0.2.1 中实际加载并正常运行**。
+> 本轮的格式扩展与探测性能重写由 AI 智能体团队分工完成，改完后另有一轮独立只读审计。
 > 欢迎提 issue。
 
 **不用编译，直接用**：[`dist/bdp_autopad.dll`](dist/bdp_autopad.dll) 就是编译好的成品，
@@ -63,15 +64,31 @@
 |---|---|
 | `第1话 羽丘的不可思议女孩` | `第01话 羽丘的不可思议女孩` |
 | `第12话 风吹浪打，亦不沉没` | `第12话 风吹浪打，亦不沉没`（够长就不动） |
+| `第1話 羽丘的不可思议女孩`（U+8A71） | `第01話 羽丘的不可思议女孩` |
+| `第1巻 序章`（U+5D29） | `第01巻 序章` |
+| `EP1 标题` / `Ep 1` / `ep.1` | `EP01 标题` / `Ep 01` / `ep.01` |
+| `[1] 标题` / `【2】标题` | `[01] 标题` / `【02】标题` |
 | `1`（纯数字） | `01` |
 | `2.` | `02.` |
 | `1 - 标题` | `01 - 标题` |
+| `第1话 标题-P2 分P名` | `第01话 标题-P02 分P名` |
 | `1080p` / `128kbps` / `2024` | **原样不动** |
 | `正片` / `原版` / `第1.5话 特别篇` | **原样不动** |
+| `OAD 感冒综合征` / `特别篇 拈花夜话` | **原样不动**（无集数就不动） |
+| `DEEP1` / `STEP3` / `HDD2` | **原样不动**（EP 守卫） |
+| `[1080p]` / `[AB12]` | **原样不动**（方括号里不是集数） |
+| `-P1080` / `-P1080p` / `-p2` | **原样不动**（分P 守卫） |
 
-- 支持 `第N话`、`第N集`、`第N期`，以及纯数字开头的文件名
+- 主路径：`第N话` / `第N集` / `第N期` / `第N話` / `第N巻`
+- 也支持 `EP1`、`Ep 1`、`ep.1` 前缀写法
+- 也支持行首方括号编号 `[1]`、`【2】`
+- 也支持纯数字开头的文件名（`1`、`2.`、`1 - 标题`）
+- 也支持分P 序号后缀（`-P2` → `-P02`）
 - `.mp4` 扩展名始终原样保留
 - 只补位、不截断，补过零的不会叠加
+
+> `regex` crate **不支持环视**，以上所有"不该动"的边界判断都是用代码手工做的（取匹配后看前后字符），
+> 所以每条守卫都有对应测试覆盖，见下方 `tools/smoke-test.ps1`。
 
 ---
 
@@ -135,9 +152,40 @@ objdump -p dist/bdp_autopad.dll | findstr "DLL Name"
 
 ```powershell
 cd bdp-autopad
-cargo test --release     # 5 个单元测试
+cargo test --release     # 10 个单元测试
 cargo build --release    # 产物 target\release\bdp_autopad.dll
 ```
+
+### 端到端冒烟测试（不用开下载器 GUI）
+
+`cargo test` 只能证明补零函数写对了，**证明不了宿主真的会这么调用**。
+`tools\smoke-test.ps1` 用 P/Invoke 直接加载 dll，按宿主 v0.2.1 真实的
+`extern "C"` 符号 + `HookInputV1` JSON 协议喂输入，逐项核对输出：
+
+```powershell
+# 必须 -ExecutionPolicy Bypass（系统默认禁止运行脚本）
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\smoke-test.ps1
+# 或直接测刚编出来的：
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\smoke-test.ps1 -DllPath target\release\bdp_autopad.dll
+```
+
+三个断言组，对应三条不同的代码路径：
+
+| `-Expect` | 验证什么 | 断言数 |
+|---|---|---|
+| `default`（不传） | 常规补零行为（依赖 `autopad.toml` 默认值） | 29 |
+| `NoPad` | 设 `AUTOPAD_ENABLED=0` 后**必须一个都不改** | 13 |
+| `Width3` | 设 `AUTOPAD_MIN_WIDTH=3` 后宽度必须变 3 | 13 |
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\smoke-test.ps1 -Expect NoPad
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\smoke-test.ps1 -Expect Width3
+```
+
+全程只读，不碰任何下载文件；环境变量只在子进程里生效，不会改你的 `autopad.toml`。
+
+> 脚本文件头必须是 **UTF-8 带 BOM**，否则 Windows PowerShell 5.1 会按 GBK 解码，
+> 中文字符串全乱（这是踩过的坑之一）。
 
 ### 工程结构
 
@@ -147,6 +195,8 @@ cargo build --release    # 产物 target\release\bdp_autopad.dll
 │   ├── lib.rs            # AfterPrepare 钩子 + 补零逻辑 + 单元测试
 │   ├── config.rs         # autopad.toml 解析（零依赖 key=value）
 │   └── episode_scan.rs   # 扫 .下载任务/*.json 聚合集数
+├── tools/
+│   └── smoke-test.ps1    # P/Invoke 端到端冒烟测试
 ├── vendor/               # 宿主 v0.2.1 的 plugin-api / plugin-sdk（MIT）
 └── dist/bdp_autopad.dll  # 编译产物
 ```
