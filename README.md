@@ -11,7 +11,7 @@
 > 34 项单元测试全部通过 → `tools\smoke-test.ps1` 用 `P/Invoke` 真实加载 dll 跑通端到端 hook 测试（**29 项断言**，另含 `NoPad` / `Width3` 两组配置覆盖共 13+13 项）→
 > 已在 bilibili-video-downloader **v0.2.1 中实际加载并正常运行**。
 > 本轮的格式扩展与探测性能重写由 AI 智能体团队分工完成，改完后另有一轮独立只读审计。
-> 审计发现的 21 项问题已按其优先级修复（详见 `审查报告` 提交），修复后测试从 26 项增至 34 项。
+> 审计发现的 21 项问题已全部修复（[`f5ec0fa`](https://github.com/Qwucaksryh/bilibili-video-downloader-autopad/commit/f5ec0fa)），单元测试从 26 项增至 34 项。
 > 欢迎提 issue。
 
 **不用编译，直接用**：[`dist/bdp_autopad.dll`](dist/bdp_autopad.dll) 就是编译好的成品，
@@ -151,9 +151,15 @@ objdump -p dist/bdp_autopad.dll | findstr "DLL Name"
 
 工具链：**Rust (GNU target)** + **mingw-w64**（提供 `gcc` / `as` / `dlltool`，缺了会在 `parking_lot_core` 处报 `dlltool could not create import library`）。
 
+> 别让别的 Rust 抢走工具链：若你另装了 MSVC 版的独立 Rust（例如 `scoop install rust`），
+> 它可能排在 `PATH` 前面，于是 cargo 去调 VS 的 `link.exe` 而非 mingw 的 `gcc`，
+> 报出 `link: extra operand` 这类与代码无关的怪错。
+> 先确认：`rustc -vV | findstr host` —— 必须是 `host: x86_64-pc-windows-gnu`。
+> 不是的话，把 rustup 的目录前置到 PATH：`$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"`。
+
 ```powershell
 cd bdp-autopad
-cargo test --release     # 25 个单元测试
+cargo test --release     # 34 个单元测试
 cargo build --release    # 产物 target\release\bdp_autopad.dll
 ```
 
@@ -183,7 +189,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\smoke-test.ps1 -Expect
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\smoke-test.ps1 -Expect Width3
 ```
 
-全程只读，不碰任何下载文件；环境变量只在子进程里生效，不会改你的 `autopad.toml`。
+全程只读，不碰任何下载文件；环境变量只在本次运行内临时生效，脚本退出前会恢复原值，不会改你的 `autopad.toml`。
 
 > 脚本文件头必须是 **UTF-8 带 BOM**，否则 Windows PowerShell 5.1 会按 GBK 解码，
 > 中文字符串全乱（这是踩过的坑之一）。
