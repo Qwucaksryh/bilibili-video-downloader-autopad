@@ -46,6 +46,36 @@ impl Default for Config {
     }
 }
 
+/// 把当前进程的控制台输出代码页切成 UTF-8，让 `eprintln!` 里的中文不乱码。
+///
+/// 为什么需要：本插件的诊断日志全是中文，而 `eprintln!` 写出的是 **UTF-8 字节**。
+/// Windows 控制台默认代码页是 GBK(936)，会把 UTF-8 字节按 GBK 解释 ——
+/// 于是 `[autopad] 已读取配置` 显示成 `[autopad] 宸茶鍙栭厤缃`。
+///
+/// 只用 Win32 的 `SetConsoleOutputCP(65001)`，不引入任何 crate；
+/// 非 Windows 平台是空实现（Unix 终端本就按字节直通，无此问题）。
+///
+/// **已知限制**：当 stderr 被**重定向**（管道 / 文件 / `2>&1`）时，Windows 不经
+/// 控制台代码页而直接写字节，本调用无效——这是系统行为，插件侧无法绕过。
+/// 那种场景下需要读取方自己按 UTF-8 解码（`tools/smoke-test.ps1` 已设置
+/// `[Console]::OutputEncoding`）。真实运行（宿主 GUI / 直接开控制台）不受影响。
+///
+/// 失败时静默忽略 —— 日志能不能显示是体验问题，绝不能因此影响插件的主功能。
+fn ensure_utf8_console() {
+    #[cfg(windows)]
+    {
+        // 65001 = CP_UTF8。返回 0 表示失败，此处刻意忽略。
+        const CP_UTF8: u32 = 65001;
+        unsafe extern "system" {
+            fn SetConsoleOutputCP(code_page: u32) -> i32;
+        }
+        // SAFETY: 调用无参数副作用的纯 Win32 API，无内存安全问题。
+        unsafe {
+            let _ = SetConsoleOutputCP(CP_UTF8);
+        }
+    }
+}
+
 impl Config {
     /// 应用运行时的配置快照，进程内只解析一次。
     pub fn get() -> &'static Self {
@@ -54,6 +84,7 @@ impl Config {
     }
 
     fn load() -> Self {
+        ensure_utf8_console();
         let mut cfg = Config::default();
 
         if let Some(path) = config_path() {
@@ -109,10 +140,12 @@ impl Config {
         self.min_width = self.min_width.clamp(1, WIDTH_LIMIT);
         self.max_width = self.max_width.clamp(self.min_width, WIDTH_LIMIT);
     }
-
     /// 解析 `key = value` 形式的配置，忽略 `#` 注释与空行。
-    fn apply_pairs(&mut self, text: &str) {
-        for raw in text.lines() {
+    ///
+    /// 已知 key 解析失败时**打日志**而不是静默吞掉：用户写 `enabled = ture`（拼错）
+    /// 会保持默认值 true，如果连一条日志都没有，他会以为插件已经被关掉 ——
+    /// 而环境变量路径（`AUTOPAD_ENABLED`）是会打日志的，两条路径行为必须一致。
+    fn apply_pairs(&mut self, text: &str) {        for raw in text.lines() {
             // `#` 只有出现在行首或前面是空白时才算注释；
             // 否则 `min_width = 2 #说明` 之外，像 `值#123` 这种含 `#` 的值会被拦腰截断。
             let cut = raw
@@ -132,23 +165,20 @@ impl Config {
             let value = value.trim().trim_matches('"').trim_matches('\'');
 
             match key {
-                "enabled" => self.enabled = parse_bool(value).unwrap_or(self.enabled),
-                "pad_filename" => self.pad_filename = parse_bool(value).unwrap_or(self.pad_filename),
+                "enabled" => self.enabled = apply_bool(self.enabled, key, value),
+                "pad_filename" => {
+                    self.pad_filename = apply_bool(self.pad_filename, key, value);
+                }
                 "pad_episode_dir" => {
-                    self.pad_episode_dir = parse_bool(value).unwrap_or(self.pad_episode_dir);
+                    self.pad_episode_dir = apply_bool(self.pad_episode_dir, key, value);
                 }
-                "fixed_width" => self.fixed_width = parse_bool(value).unwrap_or(self.fixed_width),
-                "verbose" => self.verbose = parse_bool(value).unwrap_or(self.verbose),
-                "min_width" => {
-                    if let Ok(n) = value.parse::<usize>() {
-                        self.min_width = n;
-                    }
+                "fixed_width" => {
+                    self.fixed_width = apply_bool(self.fixed_width, key, value);
                 }
-                "max_width" => {
-                    if let Ok(n) = value.parse::<usize>() {
-                        self.max_width = n;
-                    }
-                }
+                "verbose" => self.verbose = apply_bool(self.verbose, key, value),
+                "min_width" => self.min_width = apply_usize(self.min_width, key, value),
+                "max_width" => self.max_width = apply_usize(self.max_width, key, value),
+                // 未知 key 静默忽略是刻意的：向前兼容将来新增的配置项。
                 _ => {}
             }
         }
@@ -178,16 +208,46 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// 解析布尔值；无法识别时保留 `current` 并打日志（静默 fallback 会让用户误以为配置生效）。
+fn apply_bool(current: bool, key: &str, value: &str) -> bool {
+    match parse_bool(value) {
+        Some(b) => b,
+        None => {
+            eprintln!(
+                "[autopad] 配置项 {key} 的值 {value:?} 无法识别（支持 1/0、true/false、yes/no、on/off），已保持 {current}"
+            );
+            current
+        }
+    }
+}
+
+/// 解析非负整数；无法识别时保留 `current` 并打日志（同上，避免静默忽略）。
+fn apply_usize(current: usize, key: &str, value: &str) -> usize {
+    match value.parse::<usize>() {
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("[autopad] 配置项 {key} 的值 {value:?} 无法识别（需要非负整数），已保持 {current}");
+            current
+        }
+    }
+}
+
 fn config_path() -> Option<PathBuf> {
     Some(crate::app_data_dir()?.join(CONFIG_FILE_NAME))
 }
 
 /// 首次加载时把默认配置写到磁盘，方便用户直接改。
+///
+/// 用 `create_new`（原子 `O_EXCL`）而不是「`exists()` 再 `write`」：
+/// - `exists()` + `write` 之间存在 TOCTOU 窗口，宿主并发下载时多个 hook 会**同时**
+///   通过检查并各写一次，`fs::write` 是 create+truncate+write，中途可能被
+///   `Config::load` 的 `read_to_string` 读到半截内容（配置与预期不符）；
+/// - `create_new` 由文件系统保证原子性：已存在直接返回 `AlreadyExists`，天然幂等。
+///
+/// 写失败时打日志而不是 `let _ =` 静默吞掉 —— 用户会以为配置已生成好等着去改。
 pub fn write_default_config_if_absent() {
     let Some(path) = config_path() else { return };
-    if path.exists() {
-        return;
-    }
+
     let text = "# bdp-autopad 配置（改完需要重启下载器生效）\n\
                 enabled = true\n\
                 \n\
@@ -202,12 +262,34 @@ pub fn write_default_config_if_absent() {
                 pad_filename = true\n\
                 pad_episode_dir = true\n\
                 verbose = false\n";
-    let _ = std::fs::write(&path, text);
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            // 全路径引用 `Write`，避免在模块顶层引入可能与宏展开冲突的名字。
+            if let Err(err) = std::io::Write::write_all(&mut file, text.as_bytes()) {
+                eprintln!("[autopad] 写入默认配置失败: {} ({err})", path.display());
+            }
+        }
+        // 已存在 = 正常情况（用户改过或上次已生成），不是错误，静默返回。
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        // 父目录不存在等：不是致命问题（本次仍会用默认值运行），但要让用户知道。
+        Err(err) => {
+            eprintln!(
+                "[autopad] 无法创建默认配置文件 {}: {err}（本次仍按默认值运行）",
+                path.display()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// 回归：min = max = 0 时旧代码会在 width_for 的 fixed_width 分支 panic。
     #[test]
@@ -275,5 +357,83 @@ mod tests {
         let mut cfg2 = Config::default();
         cfg2.apply_pairs("# 整行注释\nmin_width = 4\t# 制表符也算空白");
         assert_eq!(cfg2.min_width, 4);
+    }
+
+    /// 回归：布尔值拼错时必须**保持原值**（而不是被静默吞掉后用户以为生效了）。
+    /// 这里同时钉住「保持原值」这一行为契约，日志走 stderr 无法在断言里直接看。
+    #[test]
+    fn unparsable_known_keys_keep_current_value() {
+        let mut cfg = Config {
+            enabled: true,
+            min_width: 2,
+            max_width: 4,
+            pad_filename: true,
+            ..Config::default()
+        };
+        // `ture` 是 `true` 的常见拼错
+        cfg.apply_pairs(
+            "enabled = ture\n\
+             pad_filename = flase\n\
+             min_width = abc\n\
+             max_width = 3.5\n\
+             verbose = maybe\n",
+        );
+        assert!(cfg.enabled, "拼错不得改变默认 true");
+        assert!(cfg.pad_filename, "拼错不得改变默认 true");
+        assert_eq!(cfg.min_width, 2, "非法整数保持原值");
+        assert_eq!(cfg.max_width, 4, "小数不是合法 usize，保持原值");
+        assert!(!cfg.verbose, "`maybe` 无法识别，保持默认 false");
+
+        // 合法值必须照常生效（确认上面不是「全部忽略」造成的假通过）
+        let mut ok = Config::default();
+        ok.apply_pairs("enabled = off\nmin_width = 3\nmax_width = 5\nverbose = yes\n");
+        assert!(!ok.enabled);
+        assert_eq!(ok.min_width, 3);
+        assert_eq!(ok.max_width, 5);
+        assert!(ok.verbose);
+    }
+
+    /// 回归：默认配置的创建必须是原子的「仅当不存在」。
+    /// 旧实现用 `exists()` + `fs::write`，存在 TOCTOU 与并发双写。
+    /// 直接验证底层语义：`create_new` 在文件已存在时必须返回 `AlreadyExists`
+    /// 且**不覆盖**已有内容（即不会把用户改过的配置冲掉）。
+    #[test]
+    fn default_config_creation_is_atomic_and_never_overwrites() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp")
+            .join(format!("cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("autopad.toml");
+
+        // 第一次：create_new 成功
+        let first = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        assert!(first.is_ok(), "首次创建应成功: {first:?}");
+        first.unwrap().write_all(b"enabled = false\n").unwrap();
+
+        // 第二次：必须 AlreadyExists，且原内容不被覆盖
+        let second = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        match second {
+            Err(e) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::AlreadyExists,
+                "已存在时必须是 AlreadyExists，供调用方静默返回"
+            ),
+            Ok(_) => panic!("已存在的文件不得被 create_new 打开并截断"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "enabled = false\n",
+            "用户已有配置必须原样保留"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

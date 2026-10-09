@@ -20,13 +20,20 @@ use bilibili_video_downloader_plugin_sdk::{
 };
 use regex::Regex;
 
-/// 抓取「第N话 / 第N集 / 第N期」（含日文写法「第N話」U+8A71、「第N巻」U+5D29）
-/// 中间的数字，容忍空格。宿主已按 Windows 文件名规则过滤过标题，不会有正则意义上的怪字符。
+/// 抓取「第N话 / 第N集 / 第N期」（含日文写法「第N話」U+8A71、「第N巻」U+5DFB，
+/// 以及中文简体「第N卷」U+5377、「第N單」等）中间的数字，容忍空格。
+/// 宿主已按 Windows 文件名规则过滤过标题，不会有正则意义上的怪字符。
 ///
 /// 注意：不在此处 `use std::sync::LazyLock`，否则会和 `export_plugin_v1!` 宏
 /// 展开出来的同名导入冲突（E0252）。这里全路径引用即可。
-static EPISODE_RE: std::sync::LazyLock<Regex> =
-    std::sync::LazyLock::new(|| Regex::new(r"第\s*(\d+)\s*[话集期話巻]").expect("正则编译失败"));
+///
+/// 字符类里的两个易混字：
+/// - `巻` U+5DFB（日文新字体「巻」）—— 与 `卷` U+5377（中文简体）**不是同一个字**，
+///   两者都要收：B 站中文标题写「第1卷」，日文标题写「第1巻」；
+/// - `單` U+55AE（繁体）、`集` U+96C6、`期` U+671F、`話` U+8A71。
+static EPISODE_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    Regex::new(r"第\s*(\d+)\s*[话話集期卷巻單]").expect("正则编译失败")
+});
 
 /// 没有「第N话」时的兜底：抓开头的纯数字，例如 `1`、`2.`、`1 - 标题`、`03、xxx`。
 ///
@@ -171,10 +178,13 @@ fn pad_text(text: &str, width: usize) -> String {
     let mut matched = false;
     let mut out = text.to_string();
 
-    if EPISODE_RE.is_match(&out) {
-        out = replace_episode(&out, width);
-        matched = true;
-    }
+    // 注意：这里不能写成 `EPISODE_RE.is_match(&out)` —— 「正则能匹配」不等于
+    // 「替换后真的有变化」。数字超出 u32 时 `splice_digits` 会静默返回原文，
+    // 此时若仍把 matched 置 true，第 190 行的兜底 `pad_leading` 就会被跳过，
+    // 出现「正则认了、但一个字符都没改」的静默漏补。改为按输出是否变化判定。
+    let (next, hit) = replace_episode(&out, width);
+    out = next;
+    matched |= hit;
     let (next, hit) = pad_ep(&out, width);
     out = next;
     matched |= hit;
@@ -192,13 +202,22 @@ fn pad_text(text: &str, width: usize) -> String {
     }
 }
 
-/// 把 `第N话` 里的 N 补零。
-fn replace_episode(text: &str, width: usize) -> String {
-    EPISODE_RE
+/// 把 `第N话` 里的 N 补零，返回 `(新文本, 是否真的发生了变化)`。
+///
+/// 返回「是否变化」而不是「正则是否命中」，是为了让 [`pad_text`] 的 `matched`
+/// 标志忠实反映实际改动 —— 否则 u32 溢出等无法补零的情况会把 `matched` 置真，
+/// 白白吃掉兜底 `pad_leading`。
+fn replace_episode(text: &str, width: usize) -> (String, bool) {
+    if !EPISODE_RE.is_match(text) {
+        return (text.to_string(), false);
+    }
+    let out = EPISODE_RE
         .replace_all(text, |caps: &regex::Captures<'_>| {
             splice_digits(&caps[0], &caps[1], width)
         })
-        .into_owned()
+        .into_owned();
+    let hit = out != text;
+    (out, hit)
 }
 
 /// 把 `EP1 / EP01 / Ep 1 / ep.1` 里的数字补零，返回 `(新文本, 是否命中)`。
@@ -208,6 +227,8 @@ fn replace_episode(text: &str, width: usize) -> String {
 /// - **匹配起点的前一个字符不能是 ASCII 字母/数字**：否则 `DEEP1`、`STEP3`、`keep9`、
 ///   `HDD2` 这类单词内部的 `ep` 会被误伤；
 /// - **数字后面不能直接跟 ASCII 字母**：否则 `EP1080p` 这种规格值会被误伤。
+///
+/// 命中判定与 [`replace_episode`] 一致：按「输出是否真的变化」算，不看正则是否匹配。
 fn pad_ep(text: &str, width: usize) -> (String, bool) {
     let mut out = String::with_capacity(text.len());
     let mut last = 0usize;
@@ -224,8 +245,14 @@ fn pad_ep(text: &str, width: usize) -> (String, bool) {
         if prev_is_word || next_is_alpha {
             continue;
         }
+        let replaced = splice_digits(whole.as_str(), &caps[1], width);
+        if replaced == whole.as_str() {
+            // 数字没变（例如 EP100 配 width 2、或 u32 溢出）：不算命中，
+            // 让文本原样流过去，交给后面的规则 / 兜底处理。
+            continue;
+        }
         out.push_str(&text[last..start]);
-        out.push_str(&splice_digits(whole.as_str(), &caps[1], width));
+        out.push_str(&replaced);
         last = end;
         matched = true;
     }
@@ -241,6 +268,8 @@ fn pad_ep(text: &str, width: usize) -> (String, bool) {
 ///
 /// 「方括号里是 `[1080p]` 这类规格值」的判断没法写成 `(?![A-Za-z])`（`regex` crate
 /// 不支持环视），只能取出来用代码判断，同 [`pad_leading`]。
+///
+/// 命中判定与 [`replace_episode`] 一致：按「输出是否真的变化」算。
 fn pad_bracket(text: &str, width: usize) -> (String, bool) {
     let Some(caps) = BRACKET_RE.captures(text) else {
         return (text.to_string(), false);
@@ -252,9 +281,13 @@ fn pad_bracket(text: &str, width: usize) -> (String, bool) {
     if text[end..].starts_with(|c: char| c.is_ascii_alphabetic()) {
         return (text.to_string(), false);
     }
+    let padded = pad_number(&caps[2], width);
+    if padded == caps[2] {
+        return (text.to_string(), false); // 数字没变：不算命中。
+    }
     let mut out = String::with_capacity(text.len());
     out.push_str(&caps[1]);
-    out.push_str(&pad_number(&caps[2], width));
+    out.push_str(&padded);
     out.push_str(&text[end..]);
     (out, true)
 }
@@ -282,8 +315,12 @@ fn pad_part(text: &str, width: usize) -> (String, bool) {
         if !next_ok {
             continue;
         }
+        let replaced = splice_digits(whole.as_str(), digits, width);
+        if replaced == whole.as_str() {
+            continue; // 数字没变：不算命中（同 replace_episode 的判定口径）。
+        }
         out.push_str(&text[last..start]);
-        out.push_str(&splice_digits(whole.as_str(), digits, width));
+        out.push_str(&replaced);
         last = end;
         matched = true;
     }
@@ -442,7 +479,7 @@ mod tests {
     #[test]
     fn pads_japanese_episode_markers() {
         let cases = [
-            // 日文写法：第N話（U+8A71）、第N巻（U+5D29）
+            // 日文写法：第N話（U+8A71）、第N巻（U+5DFB）
             ("第1話 羽丘的不可思议女孩", 3, "第001話 羽丘的不可思议女孩"),
             ("第1巻 上", 2, "第01巻 上"),
             ("第12話 标题", 3, "第012話 标题"),
@@ -580,6 +617,69 @@ mod tests {
     fn pads_all_formats_stacked_in_one_title() {
         assert_eq!(pad_text("[1] 第2话 EP3 -P4", 2), "[01] 第02话 EP03 -P04");
         assert_eq!(pad_text("[10] 第2話 标题", 3), "[010] 第002話 标题");
+    }
+
+    /// 回归：`matched` 必须按「输出是否真的变化」判定，而不是「正则是否匹配」。
+    ///
+    /// 旧实现在 `EPISODE_RE.is_match` 为真时无条件 `matched = true`；当数字超出 u32
+    /// 时 `splice_digits` 会静默返回原文，于是「正则认了、却一个字符都没改」的情况下
+    /// `matched` 仍为真，兜底 `pad_leading` 被白白跳过 —— 开头那段本该补零的数字
+    /// 就这么漏掉了。修复后这些输入应正常走兜底路径。
+    #[test]
+    fn episode_match_without_change_falls_through_to_leading_fallback() {
+        // 数字溢出 u32：`第N话` 补不了零，但开头还有一段可补的数字
+        let cases = [
+            // 开头 1 位数字 + 后文有超长「第N话」→ 开头必须补零
+            ("1 第99999999999话", 2, "01 第99999999999话"),
+            ("12 第4294967296话 标题", 3, "012 第4294967296话 标题"),
+            // 开头已经是 2 位，width 2 时不变（幂等，不算回归）
+            ("12 第4294967296话", 2, "12 第4294967296话"),
+        ];
+        for (input, width, expected) in cases {
+            assert_eq!(pad_text(input, width), expected, "input={input} width={width}");
+        }
+    }
+
+    /// 中文简体「卷」（U+5377）与日文「巻」（U+5DFB）是两个不同的字，都要认。
+    #[test]
+    fn pads_both_chinese_and_japanese_juan_markers() {
+        assert_eq!('卷' as u32, 0x5377, "简体「卷」的码点");
+        assert_eq!('巻' as u32, 0x5DFB, "日文「巻」的码点");
+        let cases = [
+            // 中文简体「卷」—— B 站中文标题常见，旧实现会漏补
+            ("第1卷 上", 2, "第01卷 上"),
+            ("第12卷 下", 3, "第012卷 下"),
+            ("第1卷 序章", 3, "第001卷 序章"),
+            // 日文「巻」保持原行为
+            ("第1巻 上", 2, "第01巻 上"),
+            // 繁体「單」
+            ("第1單 上", 2, "第01單 上"),
+            // 已有格式不受影响
+            ("第1话 标题", 2, "第01话 标题"),
+            ("第1話 标题", 2, "第01話 标题"),
+            // 只补不截
+            ("第100卷 终章", 2, "第100卷 终章"),
+        ];
+        for (input, width, expected) in cases {
+            assert_eq!(pad_text(input, width), expected, "input={input} width={width}");
+        }
+    }
+
+    /// `replace_episode` 的返回值必须忠实反映「是否真的改了」。
+    #[test]
+    fn replace_episode_reports_actual_change() {
+        use super::replace_episode;
+        // 命中且变更
+        assert_eq!(replace_episode("第1话 标题", 2), ("第01话 标题".to_string(), true));
+        // 命中但不变（已够长）→ hit 必须是 false
+        assert_eq!(replace_episode("第10话 标题", 2), ("第10话 标题".to_string(), false));
+        // 命中但溢出无法补 → hit 必须是 false
+        assert_eq!(
+            replace_episode("第4294967296话", 2),
+            ("第4294967296话".to_string(), false)
+        );
+        // 完全不匹配 → hit 必须是 false
+        assert_eq!(replace_episode("正片", 2), ("正片".to_string(), false));
     }
 
     /// 分P 视频用的是另一套目录格式（与普通视频分开）：
