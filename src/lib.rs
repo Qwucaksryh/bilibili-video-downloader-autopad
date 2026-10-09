@@ -581,4 +581,46 @@ mod tests {
         assert_eq!(pad_text("[1] 第2话 EP3 -P4", 2), "[01] 第02话 EP03 -P04");
         assert_eq!(pad_text("[10] 第2話 标题", 3), "[010] 第002話 标题");
     }
+
+    /// 分P 视频用的是另一套目录格式（与普通视频分开）：
+    /// `{collection_title}/{episode_title}/{episode_title}-P{part_order} {part_title}`
+    ///
+    /// 要求：集数只在**末级目录**和**文件名**里补零，合集目录（倒数第二级）一律不动，
+    /// 否则文件夹名与模板对不上。
+    #[test]
+    fn pads_part_video_directory_layout() {
+        let dir = Path::new(r"C:\dl\动画、游戏专辑\第1话 樱之诗OST");
+        assert_eq!(
+            pad_path(dir, 2),
+            Path::new(r"C:\dl\动画、游戏专辑\第01话 樱之诗OST"),
+            "合集目录不动，末级 episode_title 补零"
+        );
+
+        // 合集目录本身含数字也不许动
+        let dir2 = Path::new(r"C:\dl\第2季\第1话 标题");
+        assert_eq!(
+            pad_path(dir2, 2),
+            Path::new(r"C:\dl\第2季\第01话 标题"),
+            "父级 第2季 必须原样"
+        );
+
+        // 文件名 = episode_title + `-P` + part_order + 空格 + part_title
+        // 集数与分P 序号两处都补，且用同一个宽度，所以两处对齐
+        assert_eq!(
+            pad_text("第1话 樱之诗OST-P1 30.夢の歩みを見上げて", 2),
+            "第01话 樱之诗OST-P01 30.夢の歩みを見上げて"
+        );
+        assert_eq!(
+            pad_text("第1话 标题-P2 分P名", 3),
+            "第001话 标题-P002 分P名"
+        );
+        // 分P 数字已够长时只补不截（官方示例 -P30 必须原样保留）
+        assert_eq!(
+            pad_text("【高音质】樱之诗OST-P30 30.夢の歩みを見上げて", 2),
+            "【高音质】樱之诗OST-P30 30.夢の歩みを見上げて"
+        );
+        // part_title 的自身序号 `30.` 已经两位，不叠加
+        assert_eq!(pad_text("01.イントロ", 2), "01.イントロ");
+        assert_eq!(pad_text("1.イントロ", 2), "01.イントロ");
+    }
 }
