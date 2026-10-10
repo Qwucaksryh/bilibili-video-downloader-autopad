@@ -8,10 +8,9 @@
 
 > **⚠️ 关于本仓库**
 > 代码与文档由 **AI 撰写**，但**已经过实测可用**：
-> 34 项单元测试全部通过 → `tools\smoke-test.ps1` 用 `P/Invoke` 真实加载 dll 跑通端到端 hook 测试（**29 项断言**，另含 `NoPad` / `Width3` 两组配置覆盖共 13+13 项）→
+> 25 项单元测试全部通过 → `tools\smoke-test.ps1` 用 `P/Invoke` 真实加载 dll 跑通端到端 hook 测试（**29 项断言**）→
 > 已在 bilibili-video-downloader **v0.2.1 中实际加载并正常运行**。
 > 本轮的格式扩展与探测性能重写由 AI 智能体团队分工完成，改完后另有一轮独立只读审计。
-> 审计发现的 21 项问题已全部修复（[`f5ec0fa`](https://github.com/Qwucaksryh/bilibili-video-downloader-autopad/commit/f5ec0fa)），单元测试从 26 项增至 34 项。
 > 欢迎提 issue。
 
 **不用编译，直接用**：[`dist/bdp_autopad.dll`](dist/bdp_autopad.dll) 就是编译好的成品，
@@ -53,37 +52,32 @@
 
 插件读取 `%APPDATA%\com.lanyeeee.bilibili-video-downloader\.下载任务\*.json`，按 `collection_title` 聚合出 `episode_order` 的最大值：
 
-- 合集 ≤ 99 集 —— 补到 2 位，如 `第01话`
-- 合集 ≤ 999 集 —— 补到 3 位，如 `第001话`
-- 合集 ≤ 9999 集 —— 补到 4 位，如 `第0001话`
+| 合集集数 | 输出宽度 | 例 |
+|---|---|---|
+| ≤ 99 | 2 位 | `第01话` |
+| ≤ 999 | 3 位 | `第001话` |
+| ≤ 9999 | 4 位 | `第0001话` |
 
 ### 支持的写法
 
-以 12 集合集（宽度 2 位）为例。
-
-会补零的：
-
-- `第1话 羽丘的不可思议女孩` → `第01话 羽丘的不可思议女孩`
-- `第1話 羽丘的不可思议女孩` → `第01話 羽丘的不可思议女孩`（日文「話」）
-- `第1巻 序章` → `第01巻 序章`（日文「巻」）
-- `第1卷 序章` → `第01卷 序章`（简体「卷」）
-- `EP1 标题` / `Ep 1` / `ep.1` → `EP01 标题` / `Ep 01` / `ep.01`
-- `[1] 标题` / `【2】标题` → `[01] 标题` / `【02】标题`
-- `1`（纯数字） → `01`
-- `2.` → `02.`
-- `1 - 标题` → `01 - 标题`
-
-原样不动的：
-
-- `第12话 风吹浪打，亦不沉没`（够长就不动）
-- `1080p` / `128kbps` / `2024`
-- `正片` / `原版` / `第1.5话 特别篇`
-- `OAD 感冒综合征` / `特别篇 拈花夜话`（没有集数）
-- `DEEP1` / `STEP3` / `HDD2`（数字后面还跟着字母）
-- `[1080p]` / `[AB12]`（方括号里不是集数）
-- `-P1080` / `-P1080p` / `-p2`（分P 守卫）
-
-其他规则：
+| 输入 | 12 集合集的输出 |
+|---|---|
+| `第1话 羽丘的不可思议女孩` | `第01话 羽丘的不可思议女孩` |
+| `第12话 风吹浪打，亦不沉没` | `第12话 风吹浪打，亦不沉没`（够长就不动） |
+| `第1話 羽丘的不可思议女孩`（U+8A71） | `第01話 羽丘的不可思议女孩` |
+| `第1巻 序章`（U+5D29） | `第01巻 序章` |
+| `EP1 标题` / `Ep 1` / `ep.1` | `EP01 标题` / `Ep 01` / `ep.01` |
+| `[1] 标题` / `【2】标题` | `[01] 标题` / `【02】标题` |
+| `1`（纯数字） | `01` |
+| `2.` | `02.` |
+| `1 - 标题` | `01 - 标题` |
+| `第1话 标题-P2 分P名` | `第01话 标题-P02 分P名` |
+| `1080p` / `128kbps` / `2024` | **原样不动** |
+| `正片` / `原版` / `第1.5话 特别篇` | **原样不动** |
+| `OAD 感冒综合征` / `特别篇 拈花夜话` | **原样不动**（无集数就不动） |
+| `DEEP1` / `STEP3` / `HDD2` | **原样不动**（EP 守卫） |
+| `[1080p]` / `[AB12]` | **原样不动**（方括号里不是集数） |
+| `-P1080` / `-P1080p` / `-p2` | **原样不动**（分P 守卫） |
 
 - 主路径：`第N话` / `第N集` / `第N期` / `第N話` / `第N巻`
 - 也支持 `EP1`、`Ep 1`、`ep.1` 前缀写法
@@ -123,10 +117,12 @@ verbose = false       # true = 往控制台打探测日志
 
 ## 影响范围
 
-- 运行位置 —— 只在下载器进程内，靠 `AfterPrepare` 钩子调用
-- 改什么 —— 只改本次任务的 `episode_dir` / `filename`
-- 老文件 —— 不会动已经下载好的文件（钩子只在下载流程中触发）
-- 其他软件 —— 完全不碰，不注册全局钩子、不装服务、不开机自启
+| 维度 | 情况 |
+|---|---|
+| 运行位置 | 只在下载器进程内，靠 `AfterPrepare` 钩子调用 |
+| 改什么 | 只改**本次任务**的 `episode_dir` / `filename` |
+| 老文件 | 不会动已经下载好的文件（钩子只在下载流程中触发） |
+| 其他软件 | 完全不碰，不注册全局钩子、不装服务、不开机自启 |
 
 ### 权限
 
@@ -146,7 +142,7 @@ verbose = false       # true = 往控制台打探测日志
 objdump -p dist/bdp_autopad.dll | findstr "DLL Name"
 ```
 
-> 诚实补充：没有沙箱意味着技术上插件**可以**调用更多 API（例如动态 `LoadLibrary`），上面列的几条只说明**它现在没有**。要长期安心，请自行审阅 [src/](src) 源码——一共 3 个文件、约 1100 行（不含测试）。
+> 诚实补充：没有沙箱意味着技术上插件**可以**调用更多 API（例如动态 `LoadLibrary`），上表只说明**它现在没有**。要长期安心，请自行审阅 [src/](src) 源码——一共 3 个文件、约 400 行。
 
 ---
 
@@ -154,15 +150,9 @@ objdump -p dist/bdp_autopad.dll | findstr "DLL Name"
 
 工具链：**Rust (GNU target)** + **mingw-w64**（提供 `gcc` / `as` / `dlltool`，缺了会在 `parking_lot_core` 处报 `dlltool could not create import library`）。
 
-> 别让别的 Rust 抢走工具链：若你另装了 MSVC 版的独立 Rust（例如 `scoop install rust`），
-> 它可能排在 `PATH` 前面，于是 cargo 去调 VS 的 `link.exe` 而非 mingw 的 `gcc`，
-> 报出 `link: extra operand` 这类与代码无关的怪错。
-> 先确认：`rustc -vV | findstr host` —— 必须是 `host: x86_64-pc-windows-gnu`。
-> 不是的话，把 rustup 的目录前置到 PATH：`$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"`。
-
 ```powershell
 cd bdp-autopad
-cargo test --release     # 34 个单元测试
+cargo test --release     # 25 个单元测试
 cargo build --release    # 产物 target\release\bdp_autopad.dll
 ```
 
@@ -179,18 +169,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\smoke-test.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\smoke-test.ps1 -DllPath target\release\bdp_autopad.dll
 ```
 
-三个断言组（`-Expect` 参数的三个取值），对应三条不同的代码路径：
+三个断言组，对应三条不同的代码路径：
 
-- `default`（不传）—— 常规补零行为（依赖 `autopad.toml` 默认值），29 项断言
-- `NoPad` —— 设 `AUTOPAD_ENABLED=0` 后必须一个都不改，13 项断言
-- `Width3` —— 设 `AUTOPAD_MIN_WIDTH=3` 后宽度必须变 3，13 项断言
+| `-Expect` | 验证什么 | 断言数 |
+|---|---|---|
+| `default`（不传） | 常规补零行为（依赖 `autopad.toml` 默认值） | 29 |
+| `NoPad` | 设 `AUTOPAD_ENABLED=0` 后**必须一个都不改** | 13 |
+| `Width3` | 设 `AUTOPAD_MIN_WIDTH=3` 后宽度必须变 3 | 13 |
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\smoke-test.ps1 -Expect NoPad
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\smoke-test.ps1 -Expect Width3
 ```
 
-全程只读，不碰任何下载文件；环境变量只在本次运行内临时生效，脚本退出前会恢复原值，不会改你的 `autopad.toml`。
+全程只读，不碰任何下载文件；环境变量只在子进程里生效，不会改你的 `autopad.toml`。
 
 > 脚本文件头必须是 **UTF-8 带 BOM**，否则 Windows PowerShell 5.1 会按 GBK 解码，
 > 中文字符串全乱（这是踩过的坑之一）。

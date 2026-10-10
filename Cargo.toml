@@ -1,10 +1,8 @@
 [package]
 name = "bdp-autopad"
-version = "0.1.2"
+version = "0.1.1"
 edition = "2021"
 description = "自动为「第N话」补零的 bilibili-video-downloader 插件"
-license = "MIT"
-repository = "https://github.com/Qwucaksryh/bilibili-video-downloader-autopad"
 
 [lib]
 crate-type = ["cdylib"]

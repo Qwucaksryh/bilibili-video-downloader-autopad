@@ -7,19 +7,15 @@
 //! 1. **一次遍历建立全局映射**：`read_dir` 一次，逐文件**同时**抽出 `collection_title`
 //!    与 `episode_order`，建成「合集 → 最大集数」的 `HashMap`；之后任意合集 O(1) 查表。
 //!    整个会话的文件读取量从 `合集数 × 文件数` 次降到至多 `文件数` 次。
-//! 2. **指纹失效**：每次调用只做一趟「只看目录项」的轻量指纹 —— 先把目录项
-//!    **按文件名排序**（`read_dir` 的顺序不稳定），再把每个 json 文件的
+//! 2. **指纹失效**：每次调用只做一趟「只看目录项」的轻量指纹 —— 把每个 json 文件的
 //!    (文件名, 字节数, mtime) 折叠成一个 FNV-1a u64；指纹没变就直接复用旧映射、
 //!    一个文件内容都不读。文件增删、改名、长度变化、内容改写(mtime 变化)都会改变指纹；
 //!    覆盖不到的极端情况仅剩「内容被改写但长度与 mtime 被刻意保持不变」。
 //! 3. **fixed_width 短路**：`fixed_width = true` 时 `Config::width_for` 根本用不到探测值
 //!    （直接走 min_width 分支），直接返回 0，不碰磁盘、不查缓存。
 //! 4. **读失败自愈**：单个任务文件 `read_to_string` 失败时，本次映射照常写入（宁可用
-//!    不完整结果也不用过期结果），但**不写有效指纹**（盖 [`Stamp::INVALID`]），下次调用
-//!    必然重扫；目录不可读而清空缓存时打日志（仅「有数据 → 被清空」的状态跃迁，避免刷屏）。
-//!
-//! `Stamp` 用独立的 `valid` 标志表达「无有效指纹」，**不**复用 `fingerprint == 0`：
-//! 空目录折叠出来的指纹同样是 0，两者混用会让脏 map 被空目录误判为「未变化」而续命。
+//!    不完整结果也不用过期结果），但**不写指纹**（盖 `Stamp::default()`），下次调用必然
+//!    重扫；目录不可读而清空缓存时打日志（仅「有数据 → 被清空」的状态跃迁，避免刷屏）。
 //!
 //! 键的两侧都是**解码态**：payload 侧由宿主反序列化得到，磁盘侧抽出转义原文后经
 //! [`json_unescape`] 反转义 —— 不依赖 serde_json 的转义风格（`\b`/`\f`/`\uXXXX` 大小写等）。
@@ -35,33 +31,15 @@ use std::time::UNIX_EPOCH;
 const FNV_PRIME: u64 = 0x1000_0000_01b3;
 
 /// 目录指纹：对每个 json 文件的 (文件名, 字节数, mtime) 做 FNV-1a 折叠得到的 u64。
-///
-/// `valid == false` 表示「无有效指纹，必须重扫」。**不能**用 `fingerprint == 0` 兼作
-/// 该语义：空目录折叠出来的指纹恰好也是 0，两者混用会让「读失败时留下的脏 map」
-/// 被随后的空目录指纹误判为「未变化」而无限期续命。
+/// `Stamp::default()` / `Stamp::EMPTY`(0) 表示「无数据 / 指纹无效，必须重扫」。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 struct Stamp {
-    valid: bool,
     fingerprint: u64,
 }
 
 impl Stamp {
-    /// 空目录的指纹：折叠 0 字节的结果。`valid` 仍为 true —— 空目录是**已确认**的状态。
-    ///
-    /// 生产路径不直接引用本常量（`list_json_files` 由 `fingerprint` 字段自然得出该值），
-    /// 它作为**设计文档的一部分**被模块注释引用，并在测试里作为「已确认空」的判据，
-    /// 故对非测试构建显式放行 `dead_code`。
-    #[cfg_attr(not(test), allow(dead_code))]
-    const EMPTY_DIR: Self = Stamp {
-        valid: true,
-        fingerprint: 0,
-    };
-
-    /// 无有效指纹（目录不可读 / 有文件读失败）：下次调用必须重扫。
-    const INVALID: Self = Stamp {
-        valid: false,
-        fingerprint: 0,
-    };
+    /// 折叠 0 字节的结果：空目录的指纹恰好是它，也用作「无数据」哨兵。
+    const EMPTY: Self = Stamp { fingerprint: 0 };
 }
 
 /// 一次全量扫描的结果 + 判定过期用的目录指纹。
@@ -75,7 +53,7 @@ struct ScanState {
 impl ScanState {
     fn new() -> Self {
         Self {
-            stamp: Stamp::INVALID,
+            stamp: Stamp::EMPTY,
             map: HashMap::new(),
         }
     }
@@ -85,7 +63,7 @@ impl ScanState {
     /// `verbose` 时总是打；否则位数会静默回落 `min_width` 而无人知晓。
     fn clear(&mut self, why: &str, verbose: bool) {
         let had_data = !self.map.is_empty();
-        self.stamp = Stamp::INVALID;
+        self.stamp = Stamp::EMPTY;
         self.map.clear();
         if had_data || verbose {
             eprintln!(
@@ -137,9 +115,6 @@ fn refresh(state: &mut ScanState) {
         return;
     };
 
-    // 指纹相等且**有效**才算「目录未变」。仅比较 fingerprint 会让
-    // Stamp::INVALID(0) 与空目录(0) 被判为相等，从而复用掉上一次读失败时
-    // 留下的脏 map —— 所以这里比较整个 Stamp（含 valid）。
     if stamp == state.stamp {
         return; // 指纹未变：零文件内容读取，直接用旧映射。
     }
@@ -160,11 +135,11 @@ fn refresh(state: &mut ScanState) {
     state.stamp = stamp_after(stamp, read_failed);
 }
 
-/// 读失败后该盖什么指纹：任何单文件读失败都让指纹失效（`Stamp::INVALID`），
+/// 读失败后该盖什么指纹：任何单文件读失败都让指纹失效（`Stamp::default()`），
 /// 迫使下次调用重扫；零失败才保留本次扫描的指纹。
 fn stamp_after(scan: Stamp, read_failed: usize) -> Stamp {
     if read_failed > 0 {
-        Stamp::INVALID
+        Stamp::default()
     } else {
         scan
     }
@@ -172,21 +147,13 @@ fn stamp_after(scan: Stamp, read_failed: usize) -> Stamp {
 
 /// 第一趟：只看目录项，收集 json 文件路径并按 (文件名, 字节数, mtime) 计算
 /// FNV-1a 指纹 —— 不读任何文件内容。目录不可读时返回 `None`（调用方负责清缓存并打日志）。
-///
-/// **必须先排序再折叠。** `read_dir` 的迭代顺序由文件系统决定，并不保证稳定：
-/// 目录发生增删后 NTFS 可能重排索引项，同一个目录在内容语义完全未变的情况下
-/// 折叠出不同指纹，触发无谓的全量重扫（每次 hook 都要重读所有任务文件）。
-/// 按文件名排序后折叠，指纹就只取决于「目录里有什么」而非「系统以什么顺序返回」。
 fn list_json_files(dir: &Path) -> Option<(Vec<PathBuf>, Stamp)> {
     let entries = std::fs::read_dir(dir).ok()?;
-    let mut entries: Vec<_> = entries.flatten().collect();
-    entries.sort_by_key(|e| e.file_name());
-
     let mut paths: Vec<PathBuf> = Vec::new();
-    // 空目录折叠 0 字节 → 指纹 0 且 valid=true，即 Stamp::EMPTY_DIR（已确认的空状态）。
-    let mut fingerprint: u64 = 0;
+    // 空目录折叠 0 字节 → 指纹 0，恰为 Stamp::EMPTY，与初始状态一致（无需重建）。
+    let mut fingerprint: u64 = Stamp::EMPTY.fingerprint;
 
-    for entry in entries {
+    for entry in entries.flatten() {
         // 只收普通文件：过滤与 *.json 同名的目录（其 read_to_string 必失败）。
         if !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
@@ -224,13 +191,7 @@ fn list_json_files(dir: &Path) -> Option<(Vec<PathBuf>, Stamp)> {
         paths.push(entry.path());
     }
 
-    Some((
-        paths,
-        Stamp {
-            valid: true,
-            fingerprint,
-        },
-    ))
+    Some((paths, Stamp { fingerprint }))
 }
 
 /// 扩展名是否为 json（大小写不敏感）。
@@ -303,30 +264,15 @@ fn extract_json_string<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 }
 
 /// 找到 `"episode_order":` 后面的整数。
-///
-/// 容忍 `:` 与数值之间的空白（pretty-print / 人工编辑过的任务文件会写成
-/// `"episode_order": 3`），也容忍负号（宿主用它表示「未分集 / 特别篇」）。
-/// 旧实现直接 `take_while(is_ascii_digit)`，遇到空格或 `-` 立刻得到空串并返回
-/// `None` —— 那会让**整份任务文件**被静默丢弃，合集集数探测回落 0。
 fn extract_order(text: &str) -> Option<i64> {
     let key = "\"episode_order\":";
     let start = text.find(key)? + key.len();
-    let rest = text.get(start..)?.trim_start();
-    // 先取出可选负号，再取连续数字 —— 顺序不能反：`take_while(is_ascii_digit)`
-    // 遇到 `-` 会立刻返回空串，先它一步判断符号才能拿到负值。
-    let (negative, digits_src) = match rest.strip_prefix('-') {
-        Some(tail) => (true, tail),
-        None => (false, rest),
-    };
-    let digits: String = digits_src
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect();
+    let rest = text.get(start..)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     if digits.is_empty() {
         return None;
     }
-    let magnitude = digits.parse::<i64>().ok()?;
-    Some(if negative { -magnitude } else { magnitude })
+    digits.parse::<i64>().ok()
 }
 
 /// 把磁盘 JSON 里抽出的转义原文反转义成**解码态**，让映射键两侧（磁盘侧 / payload 侧）
@@ -521,8 +467,7 @@ mod tests {
         );
         assert!(names.iter().any(|n| n == "a.json"));
         assert!(names.iter().any(|n| n == "b.JSON"));
-        assert_ne!(stamp, Stamp::EMPTY_DIR);
-        assert!(stamp.valid, "能列出目录 → 指纹有效");
+        assert_ne!(stamp, Stamp::EMPTY);
 
         // 目录不存在 → None（调用方负责清缓存并打日志）
         assert!(list_json_files(&dir.join("no-such-dir")).is_none());
@@ -555,95 +500,8 @@ mod tests {
         std::fs::remove_file(dir.join("b.json")).unwrap();
         let (paths, fp5) = list_json_files(&dir).unwrap();
         assert!(paths.is_empty());
-        assert_eq!(fp5, Stamp::EMPTY_DIR, "空目录指纹为 0，但 valid 必须为 true（已确认的空）");
+        assert_eq!(fp5, Stamp::EMPTY, "空目录折叠为 0，恰与 Stamp::EMPTY 相等");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 回归：`read_dir` 的迭代顺序不稳定，指纹必须**与顺序无关**。
-    /// 做法是先排序再折叠；否则同一目录会折出不同指纹，导致每次 hook 都全量重扫。
-    #[test]
-    fn fingerprint_is_independent_of_readdir_order() {
-        let dir = temp_dir("fp-order");
-        // 故意用一组文件名，若按 read_dir 原始顺序折叠，其相对次序在不同
-        // 文件系统/不同时刻可能不同。
-        for name in ["c.json", "a.json", "d.json", "b.json"] {
-            std::fs::write(dir.join(name), format!(r#"{{"collection_title":"{name}","episode_order":1}}"#))
-                .unwrap();
-        }
-
-        let (paths, fp1) = list_json_files(&dir).unwrap();
-        // 排序生效的直接证据：返回的 paths 必须按文件名升序。
-        let names: Vec<String> = paths
-            .iter()
-            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        let mut sorted = names.clone();
-        sorted.sort();
-        assert_eq!(names, sorted, "paths 必须按文件名排序，指纹才与 read_dir 顺序无关");
-
-        // 目录内容不变 → 指纹必须完全一致（valid + fingerprint）。
-        let (_, fp2) = list_json_files(&dir).unwrap();
-        assert_eq!(fp1, fp2, "同一目录两次扫描必须得到同一指纹");
-
-        // 顺序无关的构造性验证：手工按两种不同顺序折叠，结果必须相同
-        // （排序保证了实际实现只会走其中一种）。
-        let base: u64 = 0;
-        let ordered = ["a.json", "b.json", "c.json", "d.json"];
-        let shuffled = ["d.json", "b.json", "c.json", "a.json"];
-        let fold = |order: &[&str]| {
-            let mut h = base;
-            for n in order {
-                h = fnv1a(h, n.as_bytes());
-            }
-            h
-        };
-        assert_ne!(fold(&ordered), fold(&shuffled), "未排序时顺序确实会影响指纹");
-        assert_eq!(fold(&ordered), fold(&ordered), "排序后的唯一顺序给出唯一指纹");
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 回归：读失败留下的脏 map **不能**被随后的空目录指纹续命。
-    ///
-    /// 旧实现把「空目录指纹 0」与「无有效指纹」复用同一个值，于是
-    /// 「读失败(盖 0) → 目录被清空(指纹 0)」会让 `stamp == state.stamp` 成立，
-    /// 脏 map 被当作「未变化」无限期复用。
-    #[test]
-    fn invalid_stamp_never_equals_empty_dir_stamp() {
-        assert_ne!(
-            Stamp::INVALID,
-            Stamp::EMPTY_DIR,
-            "「无有效指纹」与「已确认的空目录」必须是两个不同的状态"
-        );
-        assert!(!Stamp::INVALID.valid);
-        assert!(Stamp::EMPTY_DIR.valid);
-
-        // 复刻 refresh 的判定：读失败后的 state 与随后的空目录不得被判为「未变化」。
-        let mut state = ScanState::new();
-        assert_eq!(state.stamp, Stamp::INVALID, "初始状态必须是无有效指纹");
-
-        // 模拟一次「有文件但读失败」：map 被写入（脏），指纹无效。
-        state.map.insert("脏合集".to_string(), 999);
-        state.stamp = stamp_after(Stamp { valid: true, fingerprint: 12345 }, 1);
-        assert_eq!(state.stamp, Stamp::INVALID);
-
-        // 紧接着目录变空：指纹是 EMPTY_DIR。必须**不相等**，从而触发重建并清掉脏数据。
-        let (_, empty) = {
-            let dir = temp_dir("fp-empty");
-            let r = list_json_files(&dir).unwrap();
-            let _ = std::fs::remove_dir_all(&dir);
-            r
-        };
-        assert_eq!(empty, Stamp::EMPTY_DIR);
-        assert_ne!(
-            empty, state.stamp,
-            "空目录必须与「无有效指纹」不同，否则脏 map 会被续命"
-        );
-
-        // 初始为空目录 → 也是有效的「已确认空」指纹，不应触发重建。
-        let mut fresh = ScanState::new();
-        fresh.stamp = empty;
-        assert_eq!(fresh.stamp, empty, "已确认的空目录复用是允许的");
     }
 
     #[test]
@@ -664,58 +522,22 @@ mod tests {
         assert_eq!(map.get("甲"), Some(&12), "不完整映射照常保留（同合集取最大集数）");
 
         // P1 核心：读失败 → 盖无效指纹，下次调用必重扫自愈；零失败才保留本次指纹
-        assert_eq!(stamp_after(stamp, read_failed), Stamp::INVALID);
+        assert_eq!(stamp_after(stamp, read_failed), Stamp::default());
         assert_eq!(stamp_after(stamp, 0), stamp);
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 回归：`extract_order` 必须容忍冒号与数值之间的空白。
-    ///
-    /// 旧实现紧跟冒号后 `take_while(is_ascii_digit)`，遇到空格立刻得到空串返回
-    /// `None`，整份任务文件被静默丢弃 —— 一旦宿主写成 pretty-print，全站集数
-    /// 探测失效、补零宽度静默回落到 min_width。
-    #[test]
-    fn extract_order_tolerates_whitespace_after_colon() {
-        // 紧凑格式（宿主默认）
-        assert_eq!(extract_order(r#"{"episode_order":3,"x":1}"#), Some(3));
-        // 冒号后带空格（pretty-print / 人工编辑）
-        assert_eq!(extract_order(r#"{"episode_order": 3,"x":1}"#), Some(3));
-        assert_eq!(extract_order("{\n  \"episode_order\":   42,\n}"), Some(42));
-        assert_eq!(extract_order(r#"{"episode_order":	7}"#), Some(7)); // 制表符
-        // 换行
-        assert_eq!(extract_order("{\"episode_order\":\n95}"), Some(95));
-
-        // 负数：宿主用 -1 表示「未分集 / 特别篇」，不能整条丢弃
-        assert_eq!(extract_order(r#"{"episode_order":-1}"#), Some(-1));
-        assert_eq!(extract_order(r#"{"episode_order": -12,"x":1}"#), Some(-12));
-
-        // 真正缺字段 / 无数字 → None
-        assert_eq!(extract_order(r#"{"other":1}"#), None);
-        assert_eq!(extract_order(r#"{"episode_order":"3"}"#), None, "字符串不算数");
-        assert_eq!(extract_order(r#"{"episode_order":}"#), None);
-        assert_eq!(extract_order(r#"{"episode_order":abc}"#), None);
-
-        // 与真实抽取联用（加空格的伪造任务文件）
-        let json = r#"{"collection_title":"空格式测试","episode_order": 12 }"#;
-        let raw = extract_json_string(json, "\"collection_title\":").expect("应能抽出标题");
-        assert_eq!(json_unescape(raw), "空格式测试");
-        assert_eq!(extract_order(json), Some(12));
     }
 
     #[test]
     fn clear_resets_stamp_and_map() {
         let mut state = ScanState::new();
         state.map.insert("k".to_string(), 3);
-        state.stamp = Stamp {
-            valid: true,
-            fingerprint: 9,
-        };
+        state.stamp = Stamp { fingerprint: 9 };
         state.clear("测试：目录不可读", false); // 有数据 → 被清空（跃迁，会打一条日志）
         assert!(state.map.is_empty());
-        assert_eq!(state.stamp, Stamp::INVALID);
+        assert_eq!(state.stamp, Stamp::EMPTY);
         state.clear("测试：目录不可读", false); // 已无数据且非 verbose → 静默
         assert!(state.map.is_empty());
-        assert_eq!(state.stamp, Stamp::INVALID);
+        assert_eq!(state.stamp, Stamp::EMPTY);
     }
 }

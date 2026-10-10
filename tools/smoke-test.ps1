@@ -36,17 +36,6 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-
-# 插件用 eprintln! 写中文日志（UTF-8 字节）。本脚本若被重定向（`> log.txt`、`| Out-String`），
-# Windows 不会走控制台代码页，字节会按 GBK 解码成乱码。统一把控制台编码设为 UTF-8，
-# 重定向与终端直看两种场景都能正确显示。
-try {
-    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-    $OutputEncoding = [System.Text.Encoding]::UTF8
-} catch {
-    # 无控制台句柄（如被完全托管）时忽略：编码显示是体验问题，不应中断测试。
-}
-
 # $PSScriptRoot 在 Windows PowerShell 5.1 的 param 默认值里是空的，改用 $MyInvocation
 if (-not $DllPath) {
     $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -114,11 +103,7 @@ public static class Smoke {
     }
 }
 "@
-# 同一个 PowerShell 会话里重复运行本脚本时，`Add-Type` 会因 `Smoke` 类型已存在而抛错
-# （$ErrorActionPreference='Stop' 下直接终止）。先探测再加载，使脚本可重复运行。
-if (-not ('Smoke' -as [type])) {
-    Add-Type -TypeDefinition $csharp -ErrorAction Stop
-}
+Add-Type -TypeDefinition $csharp -ErrorAction Stop
 
 $script:pass = 0
 $script:fail = 0
@@ -132,14 +117,6 @@ function Assert-Equal($name, $actual, $expected) {
         Write-Host ("         期望: {0}" -f $expected) -ForegroundColor Yellow
         Write-Host ("         实际: {0}" -f $actual) -ForegroundColor Yellow
     }
-}
-
-# 记录一条失败但**不**中断脚本：否则 hook 出错时整个脚本会硬崩，
-# 后面几十条断言一条都不跑，最终汇总也看不到 —— 等于把「失败」变成了「无输出」。
-function Fail-With($name, $detail) {
-    $script:fail++
-    Write-Host ("  [FAIL] {0}" -f $name) -ForegroundColor Red
-    Write-Host ("         {0}" -f $detail) -ForegroundColor Yellow
 }
 
 Write-Host "`n=== 1. descriptor ===" -ForegroundColor Cyan
@@ -199,30 +176,14 @@ function New-HookInput {
 }
 
 function Invoke-Pad {
-    param([string]$InputJson, [string]$CaseName = '(未命名用例)')
+    param([string]$InputJson)
     $rc = [Smoke]::RunHook($InputJson)
-    if ($rc -ne 0) {
-        # 不再 throw：改成记一次失败并返回带哨兵字段的对象，
-        # 让后续用例继续跑完、最后的汇总数字仍然可信。
-        Fail-With $CaseName "hook 返回错误 rc=$rc : $([Smoke]::LastOut)"
-        return [pscustomobject]@{ __failed = $true; filename = "<hook 失败>"; episode_dir = "<hook 失败>" }
-    }
+    if ($rc -ne 0) { throw "hook 返回错误 rc=$rc : $([Smoke]::LastOut)" }
     $out = ([Smoke]::LastOut | ConvertFrom-Json)
-    $progress = $out.payload.AfterPrepare.progress
-    if ($null -eq $progress) {
-        Fail-With $CaseName "hook 输出里取不到 payload.AfterPrepare.progress"
-        return [pscustomobject]@{ __failed = $true; filename = "<输出为空>"; episode_dir = "<输出为空>" }
-    }
-    return $progress
+    return $out.payload.AfterPrepare.progress
 }
 
 if ($Expect -ne 'default') {
-    # 环境变量是**当前会话**级别的，脚本结束后会残留并污染后续运行
-    # （先跑 NoPad 再跑 default，default 组会全部失败且极难定位）。
-    # 记下原值，在脚本的每个出口用 finally 恢复。
-    $savedEnabled  = $env:AUTOPAD_ENABLED
-    $savedMinWidth = $env:AUTOPAD_MIN_WIDTH
-    try {
     if ($Expect -eq 'NoPad') {
         $env:AUTOPAD_ENABLED = '0'
         Write-Host "`n=== [配置覆盖] AUTOPAD_ENABLED=0：必须一个都不改 ===" -ForegroundColor Cyan
@@ -243,8 +204,7 @@ if ($Expect -ne 'default') {
         "正片"
     )
     foreach ($one in $cases) {
-        $p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base2 $one) "覆盖组: $one"
-        if ($p.__failed) { continue }
+        $p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base2 $one)
         if ($Expect -eq 'NoPad') {
             Assert-Equal "禁用后不动: $one" $p.filename $one
         } else {
@@ -264,103 +224,94 @@ if ($Expect -ne 'default') {
     }
     Write-Host ""
     Write-Host ("通过 {0} / 失败 {1}" -f $script:pass, $script:fail) -ForegroundColor $(if ($script:fail -eq 0) { "Green" } else { "Red" })
-    if ($script:fail -eq 0) {
-        Write-Host "配置覆盖冒烟通过 ✅" -ForegroundColor Green
-        exit 0
-    }
+    if ($script:fail -eq 0) { Write-Host "配置覆盖冒烟通过 ✅" -ForegroundColor Green; exit 0 }
     Write-Host "配置覆盖冒烟存在失败 ❌" -ForegroundColor Red
     exit 1
-    } finally {
-        # 无论正常走完还是中途 exit，都必须恢复环境变量，避免污染后续运行。
-        # `exit` 会先跑 finally 再退出，所以这里能覆盖所有出口。
-        $env:AUTOPAD_ENABLED  = $savedEnabled
-        $env:AUTOPAD_MIN_WIDTH = $savedMinWidth
-    }
 }
 
 Write-Host "`n=== 2. 补零行为（宽度=2，合集「魔女之旅」共 12 集）===" -ForegroundColor Cyan
 $base = "C:\Users\Admin\Videos\bilibili Download\魔女之旅"
 
 # 第N话：主路径（真实数据里 97.6% 是这个）
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 羽丘的不可思议女孩" $base "第1话 羽丘的不可思议女孩") "第1话->第01话"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 羽丘的不可思议女孩" $base "第1话 羽丘的不可思议女孩")
 Assert-Equal "第1话 -> 第01话"      $p.filename "第01话 羽丘的不可思议女孩"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 12 "第12话 风吹浪打，亦不沉没" $base "第12话 风吹浪打，亦不沉没") "第12话够长不动"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 12 "第12话 风吹浪打，亦不沉没" $base "第12话 风吹浪打，亦不沉没")
 Assert-Equal "第12话 够长不动"       $p.filename "第12话 风吹浪打，亦不沉没"
 
 # 纯数字（目录格式只写 {episode_order} 时）
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "1") "裸数字1"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "1")
 Assert-Equal "裸数字 1 -> 01"        $p.filename "01"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 2 "第2话 x" $base "2.") "带点2."
+$p = Invoke-Pad (New-HookInput "魔女之旅" 2 "第2话 x" $base "2.")
 Assert-Equal "带点 2. -> 02."        $p.filename "02."
 
 # 不该误伤
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "1080p") "1080p不动"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "1080p")
 Assert-Equal "1080p 不动"            $p.filename "1080p"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "正片") "正片不动"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "正片")
 Assert-Equal "正片不动"              $p.filename "正片"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "OAD 感冒综合征") "OAD不动"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "OAD 感冒综合征")
 Assert-Equal "OAD 标题不动"          $p.filename "OAD 感冒综合征"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "特别篇 拈花夜话") "特别篇不动"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "特别篇 拈花夜话")
 Assert-Equal "特别篇不动"            $p.filename "特别篇 拈花夜话"
 
 # 已补过零的不叠加
-$p = Invoke-Pad (New-HookInput "魔女之旅" 7 "第7话 x" $base "第007话 已补过") "已补零不叠加"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 7 "第7话 x" $base "第007话 已补过")
 Assert-Equal "已补零不叠加"          $p.filename "第07话 已补过"
 
 Write-Host "`n=== 3. episode_dir 只改末级、父级保持 ===" -ForegroundColor Cyan
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" "$base\1" "1") "子目录1->01"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" "$base\1" "1")
 Assert-Equal "子目录 1 -> 01"        $p.episode_dir "$base\01"
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "第1话 x") "父级合集名不动"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "第1话 x")
 Assert-Equal "父级合集名不动"        $p.episode_dir $base
 
 Write-Host "`n=== 4. 跨合集位数推导（95 集合集同样 2 位）===" -ForegroundColor Cyan
 $long = "C:\Users\Admin\Videos\bilibili Download\成龙历险记 中文配音"
-$p = Invoke-Pad (New-HookInput "成龙历险记 中文配音" 95 "第95话 终章" $long "第95话 终章") "第95话够长不动"
+$p = Invoke-Pad (New-HookInput "成龙历险记 中文配音" 95 "第95话 终章" $long "第95话 终章")
 Assert-Equal "第95话 够长不动"       $p.filename "第95话 终章"
-$p = Invoke-Pad (New-HookInput "成龙历险记 中文配音" 3 "第3话 终章" $long "第3话 终章") "第3话->第03话"
+$p = Invoke-Pad (New-HookInput "成龙历险记 中文配音" 3 "第3话 终章" $long "第3话 终章")
 Assert-Equal "第3话 -> 第03话"       $p.filename "第03话 终章"
 
 Write-Host "`n=== 5. 本轮新增格式（宽度=2）===" -ForegroundColor Cyan
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1話 羽丘的不可思议女孩" $base "第1話 羽丘的不可思议女孩") "第1話->第01話"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1話 羽丘的不可思议女孩" $base "第1話 羽丘的不可思议女孩")
 Assert-Equal "第1話 -> 第01話"      $p.filename "第01話 羽丘的不可思议女孩"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1巻 序章" $base "第1巻 序章") "第1巻->第01巻"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1巻 序章" $base "第1巻 序章")
 Assert-Equal "第1巻 -> 第01巻"      $p.filename "第01巻 序章"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "EP1 标题" $base "EP1 标题") "EP1->EP01"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "EP1 标题" $base "EP1 标题")
 Assert-Equal "EP1 -> EP01"          $p.filename "EP01 标题"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "ep.1 标题" $base "ep.1 标题") "ep.1->ep.01"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "ep.1 标题" $base "ep.1 标题")
 Assert-Equal "ep.1 -> ep.01"        $p.filename "ep.01 标题"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "[1] 标题") "[1]->[01]"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "[1] 标题")
 Assert-Equal "[1] -> [01]"          $p.filename "[01] 标题"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 2 "第2话 x" $base "【2】标题") "【2】->【02】"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 2 "第2话 x" $base "【2】标题")
 Assert-Equal "【2】 -> 【02】"      $p.filename "【02】标题"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "第1话 标题-P2 分P名") "-P2->-P02"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "第1话 标题-P2 分P名")
 Assert-Equal "-P2 -> -P02"          $p.filename "第01话 标题-P02 分P名"
 
 # 新格式的反向守卫：regex crate 无环视，全靠手工边界判断，最怕误伤
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "DEEP1") "DEEP1不动"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "DEEP1")
 Assert-Equal "DEEP1 不动"           $p.filename "DEEP1"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "[1080p]") "[1080p]不动"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 x" $base "[1080p]")
 Assert-Equal "[1080p] 不动"         $p.filename "[1080p]"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 标题-P1080" $base "第1话 标题-P1080") "-P1080不动"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 标题-P1080" $base "第1话 标题-P1080")
 Assert-Equal "-P1080 不动"          $p.filename "第01话 标题-P1080"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 标题-P1080p" $base "第1话 标题-P1080p") "-P1080p不动"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "第1话 标题-P1080p" $base "第1话 标题-P1080p")
 Assert-Equal "-P1080p 不动"         $p.filename "第01话 标题-P1080p"
 
-$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "EP1080p 标题" $base "EP1080p 标题") "EP1080p不动"
+$p = Invoke-Pad (New-HookInput "魔女之旅" 1 "EP1080p 标题" $base "EP1080p 标题")
 Assert-Equal "EP1080p 不动"         $p.filename "EP1080p 标题"
 
 # ---- 汇总 -----------------------------------------------------------------
